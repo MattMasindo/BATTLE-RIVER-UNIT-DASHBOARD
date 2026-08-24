@@ -611,6 +611,7 @@ function App() {
       return { ok: false, message: dup ? "That APP serial is already logged." : "Couldn't save. Try again." };
     }
     await loadTeamData();
+    logEvent("submission_added", advisorCode, { amount: amt });
     return { ok: true };
   };
  
@@ -642,6 +643,7 @@ function App() {
     var res = await sb.from("referrals").insert({ candidate_name: name, recipient_code: recipientCode, stage: "Attended Forum" });
     if (res.error) return { ok: false, message: "Couldn't save. Try again." };
     await loadTeamData();
+    logEvent("referral_added", recipientCode);
     return { ok: true };
   };
  
@@ -783,6 +785,21 @@ function App() {
   var myWeekDayLabels = weekRows.filter(function (e) { return e.advisor_code === myCode; }).map(function (e) { return weekdayLabel(e.entry_date); });
   var currentStreak = currentStreakFrom(myEntries);
   var bestStreak = bestStreakFrom(myEntries);
+ 
+  // Fires once, the first time this advisor's streak is seen dropping from
+  // something to zero (compared against the last value we saw for them,
+  // kept in localStorage). Doesn't fire on first-ever load with no prior
+  // value, and doesn't re-fire every render while the streak just sits
+  // at zero \u2014 only on the transition.
+  useEffect(function () {
+    if (!myCode) return;
+    var key = "br-last-streak-" + myCode;
+    var prev = lget(key, null);
+    if (prev != null && prev > 0 && currentStreak === 0) {
+      logEvent("streak_broken", myCode, { previous_streak: prev });
+    }
+    if (prev !== currentStreak) lset(key, currentStreak);
+  }, [myCode, currentStreak]);
  
   var monthStart = startOfMonth(today);
   var monthRows = teamEntries.filter(function (e) { return e.entry_date >= monthStart && e.entry_date <= today; });
@@ -942,7 +959,8 @@ function App() {
         onDeleteSubmission: deleteSubmission,
         onSetAdvisorActive: setAdvisorActive,
         pendingRoster: pendingRoster, onAddAdvisor: managerCreateAdvisor,
-        onApproveAdvisor: approveAdvisor, onRejectAdvisor: rejectAdvisor
+        onApproveAdvisor: approveAdvisor, onRejectAdvisor: rejectAdvisor,
+        myCode: myCode
       }),
       view === "recruitment" && isManager && h(RecruitmentView, {
         readOnly: true, today: today, scorecard: recruitment.scorecard, forumEvents: recruitment.forumEvents,
@@ -1291,6 +1309,16 @@ function AdvisorView(props) {
   var refSavingState = useState(false); var refSaving = refSavingState[0], setRefSaving = refSavingState[1];
   var refMsgState = useState(""); var refMsg = refMsgState[0], setRefMsg = refMsgState[1];
   var refOkState = useState(true); var refOk = refOkState[0], setRefOk = refOkState[1];
+ 
+  // "This week's leaderboard" further down this same screen has no tab or
+  // tap to gate a view event behind, so this fires once per advisor per
+  // mount \u2014 the closest honest signal to "they saw the leaderboard" we
+  // can get without an IntersectionObserver.
+  useEffect(function () {
+    if (!myCode) return;
+    logEvent("leaderboard_viewed", myCode, { view: "advisor_home" });
+  }, [myCode]);
+ 
   var submitReferral = async function () {
     if (!newRefName.trim()) { setRefOk(false); setRefMsg("Enter a name first."); return; }
     setRefSaving(true);
@@ -1600,7 +1628,8 @@ function ManagerView(props) {
     submissions = props.submissions || [], onSetSubmissionSettled = props.onSetSubmissionSettled,
     onDeleteSubmission = props.onDeleteSubmission,
     pendingRoster = props.pendingRoster || [], onAddAdvisor = props.onAddAdvisor,
-    onApproveAdvisor = props.onApproveAdvisor, onRejectAdvisor = props.onRejectAdvisor;
+    onApproveAdvisor = props.onApproveAdvisor, onRejectAdvisor = props.onRejectAdvisor,
+    myCode = props.myCode;
   var selectedState = useState(null); var selected = selectedState[0], setSelected = selectedState[1];
   var addAdvisorState = useState(false); var showAddAdvisor = addAdvisorState[0], setShowAddAdvisor = addAdvisorState[1];
   var editState = useState(false); var editingTargets = editState[0], setEditingTargets = editState[1];
@@ -1610,6 +1639,14 @@ function ManagerView(props) {
   var openRecState = useState(null); var openRec = openRecState[0], setOpenRec = openRecState[1];
   var searchState = useState(""); var search = searchState[0], setSearch = searchState[1];
   var showRemovedState = useState(false); var showRemoved = showRemovedState[0], setShowRemoved = showRemovedState[1];
+ 
+  // Fires once when the Manager view mounts, capturing the default tab
+  // ("pipeline") \u2014 without this, a manager who never taps a different
+  // lane would never generate a leaderboard_viewed event at all.
+  useEffect(function () {
+    logEvent("leaderboard_viewed", myCode, { view: "manager", lane: lbTab });
+    // eslint-disable-next-line
+  }, []);
  
   var csv = useMemo(function () {
     var cutoff = todayStr(-59);
@@ -1731,7 +1768,7 @@ function ManagerView(props) {
             missingToday.map(function (r) { return h("div", { key: r.code, className: "px-4 py-3 text-sm", style: { color: COLORS.ink } }, r.name); })
           )
     ),
-      h("div", null,
+    h("div", null,
       h(SectionTitle, { label: "30-Day Consistency" }),
       h("div", { style: { color: COLORS.slate }, className: "text-[11px] leading-relaxed mb-2.5" },
         "Left to right = last 30 days, oldest to today. Gold = full funnel, teal = logged, dim = missed. Weekends show faded and don't count toward the " + last30WeekdayCount + " weekdays."),
@@ -1853,7 +1890,7 @@ function ManagerView(props) {
       h("div", { className: "flex gap-2 mb-2.5" },
         LANES.map(function (lane) {
           return h("button", {
-            key: lane.key, onClick: function () { setLbTab(lane.key); },
+            key: lane.key, onClick: function () { setLbTab(lane.key); logEvent("leaderboard_viewed", myCode, { view: "manager", lane: lane.key }); },
             style: { background: lbTab === lane.key ? COLORS.brass : COLORS.card, color: lbTab === lane.key ? "white" : COLORS.slate, borderColor: COLORS.line },
             className: "px-3 py-1.5 rounded-full border text-xs font-medium"
           }, lane.label);
