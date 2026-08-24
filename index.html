@@ -126,6 +126,21 @@ function referralPayout(r) {
 }
 var LANE_MINIMUMS = { grind: 15 };
  
+// A lane's minimum is a qualification bar, not a tiebreaker: the top scorer
+// only "leads" (and only gets credited/paid) if they clear it. If nobody
+// has cleared it yet, nobody leads that lane this month — the money simply
+// isn't owed to anyone, regardless of who's currently #1. Raw leaderboard
+// rank/values elsewhere are unaffected by this and keep showing everyone's
+// real standing, since that's motivational info, not a payout claim.
+function laneQualifies(row, laneKey) {
+  var min = LANE_MINIMUMS[laneKey];
+  return !!row && (min == null || row[laneKey] >= min);
+}
+function qualifiedLaneLeader(rows, laneKey) {
+  var top = rows.length ? rows[0] : null;
+  return laneQualifies(top, laneKey) ? top : null;
+}
+ 
 function laneBasisText(laneKey, value) {
   if (laneKey === "grosser") return fmtPhp(value) + " settled FYP";
   if (laneKey === "pipeline") return value + " new prospects";
@@ -145,15 +160,13 @@ function receivableItems(code, referrals, monthBoards) {
   });
   LANES.forEach(function (lane) {
     var rows = monthBoards[lane.key] || [];
-    var leader = rows.length ? rows[0] : null;
+    var leader = qualifiedLaneLeader(rows, lane.key);
     if (!leader || leader.code !== code || !(leader[lane.key] > 0)) return;
-    var min = LANE_MINIMUMS[lane.key];
     items.push({
       kind: "projected",
       amount: LANE_AMOUNTS[lane.key],
       label: "Leading " + lane.label,
-      detail: laneBasisText(lane.key, leader[lane.key]),
-      belowMin: min != null && leader[lane.key] < min ? min : null
+      detail: laneBasisText(lane.key, leader[lane.key])
     });
   });
   return items;
@@ -235,7 +248,7 @@ var WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"];
 var BADGE_LEVELS = [10, 20, 30, 45, 90];
 var LANES = [
   { key: "pipeline", label: "Pipeline Builder", hint: "New prospects, this month" },
-  { key: "grind", label: "Grind Master", hint: "Clients presented (FNA), this month · min. 15" },
+  { key: "grind", label: "Grind Master", hint: "Clients presented (FNA), this month · min. 15 to qualify for the payout" },
   { key: "grosser", label: "Top Grosser", hint: "FYP settled (manager-verified), this month" }
 ];
 var LANE_AMOUNTS = { pipeline: 300, grind: 500, grosser: 700 };
@@ -1308,8 +1321,8 @@ function AdvisorView(props) {
   }, 0);
   var laneStatus = LANES.map(function (lane) {
     var rows = monthBoards[lane.key] || [];
-    var leader = rows.length ? rows[0] : null;
-    var leading = !!(leader && leader.code === myCode && leader[lane.key] > 0);
+    var leader = qualifiedLaneLeader(rows, lane.key);
+    var leading = !!(leader && leader.code === myCode);
     return { key: lane.key, label: lane.label, leading: leading, amount: LANE_AMOUNTS[lane.key] };
   });
   var projectedTotal = laneStatus.reduce(function (s, l) { return s + (l.leading ? l.amount : 0); }, 0);
@@ -1418,13 +1431,17 @@ function AdvisorView(props) {
       h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4 space-y-5" },
         LANES.map(function (lane) {
           var rows = monthBoards[lane.key] || [];
-          var leader = rows.length ? rows[0] : null;
+          var topRow = rows.length ? rows[0] : null;
           var mine = rows.filter(function (r) { return r.code === myCode; })[0];
           var mineVal = mine ? mine[lane.key] : 0;
-          var leaderVal = leader ? leader[lane.key] : 0;
+          var leaderVal = topRow ? topRow[lane.key] : 0;
           var max = Math.max(leaderVal, 1);
           var fmt = lane.key === "grosser" ? fmtPhp : function (v) { return v; };
-          var leading = !!(leader && leader.code === myCode && leaderVal > 0);
+          var iAmTop = !!(topRow && topRow.code === myCode && leaderVal > 0);
+          var qualifies = laneQualifies(topRow, lane.key);
+          var leading = iAmTop && qualifies;
+          var leadingButUnqualified = iAmTop && !qualifies;
+          var min = LANE_MINIMUMS[lane.key];
           return h("div", { key: lane.key },
             h("div", { className: "flex items-end justify-between mb-1" },
               h("div", null,
@@ -1433,7 +1450,9 @@ function AdvisorView(props) {
               ),
               leading
                 ? h("span", { style: { background: "rgba(242,183,5,0.14)", color: COLORS.brass }, className: "text-[10px] font-semibold px-2 py-1 rounded-lg" }, "Leading")
-                : h("span", { style: { color: COLORS.slate }, className: "text-[11px] font-mono" }, "leader " + fmt(leaderVal))
+                : leadingButUnqualified
+                  ? h("span", { style: { background: "rgba(214,90,60,0.14)", color: COLORS.rust }, className: "text-[10px] font-semibold px-2 py-1 rounded-lg" }, "#1 \u2014 needs " + min + " to qualify")
+                  : h("span", { style: { color: COLORS.slate }, className: "text-[11px] font-mono" }, "leader " + fmt(leaderVal))
             ),
             h("div", { style: { color: COLORS.slate }, className: "text-[10px] mb-1.5" }, lane.hint),
             h("div", { style: { background: COLORS.parchment }, className: "h-2 rounded-full overflow-hidden" },
@@ -1590,6 +1609,7 @@ function ManagerView(props) {
   var lbTabState = useState("pipeline"); var lbTab = lbTabState[0], setLbTab = lbTabState[1];
   var openRecState = useState(null); var openRec = openRecState[0], setOpenRec = openRecState[1];
   var searchState = useState(""); var search = searchState[0], setSearch = searchState[1];
+  var showRemovedState = useState(false); var showRemoved = showRemovedState[0], setShowRemoved = showRemovedState[1];
  
   var csv = useMemo(function () {
     var cutoff = todayStr(-59);
@@ -1605,7 +1625,7 @@ function ManagerView(props) {
     return rows.map(function (r) { return r.join(","); }).join("\n");
   }, [teamEntries, roster]);
  
-  var advisorRows = roster.map(function (r) {
+  var renderAdvisorRow = function (r) {
     var todayEntry = teamEntries.filter(function (e) { return e.advisor_code === r.code && e.entry_date === date; })[0];
     var total = entryTotal(todayEntry);
     var isOpen = selected === r.code;
@@ -1641,7 +1661,9 @@ function ManagerView(props) {
             })
       )
     );
-  });
+  };
+  var activeAdvisors = roster.filter(function (r) { return r.active !== false; });
+  var removedAdvisors = roster.filter(function (r) { return r.active === false; });
  
   return h("div", { className: "px-5 mt-6 space-y-6" },
     h("div", { className: "flex items-center justify-between" },
@@ -1827,9 +1849,7 @@ function ManagerView(props) {
                       },
                         h("div", { className: "min-w-0" },
                           h("div", { style: { color: COLORS.ink }, className: "text-[12px] font-medium" }, it.label),
-                          h("div", { style: { color: COLORS.slate }, className: "text-[10px] font-mono" }, it.detail),
-                          it.belowMin != null && h("div", { style: { color: COLORS.rust }, className: "text-[10px] mt-0.5" },
-                            "Below the stated minimum of " + it.belowMin)
+                          h("div", { style: { color: COLORS.slate }, className: "text-[10px] font-mono" }, it.detail)
                         ),
                         h("div", { className: "text-right shrink-0" },
                           h("div", { style: { color: it.kind === "confirmed" ? COLORS.good : COLORS.brass }, className: "font-mono text-[12px] font-semibold" }, fmtPhp(it.amount)),
@@ -1947,7 +1967,21 @@ function ManagerView(props) {
     pendingRoster.length > 0 && h(PendingApprovalCard, { pendingRoster: pendingRoster, onApprove: onApproveAdvisor, onReject: onRejectAdvisor }),
     h("div", null,
       h(SectionTitle, { label: "Advisors" }),
-      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border divide-y" }, advisorRows)
+      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border divide-y" },
+        activeAdvisors.length > 0
+          ? activeAdvisors.map(renderAdvisorRow)
+          : h("div", { style: { color: COLORS.slate }, className: "p-4 text-sm text-center" }, "No active advisors.")
+      ),
+      removedAdvisors.length > 0 && h("div", { className: "mt-2" },
+        h("button", {
+          onClick: function () { setShowRemoved(!showRemoved); },
+          style: { color: COLORS.slate },
+          className: "text-xs font-mono px-1 py-1.5"
+        }, (showRemoved ? "▾ Hide " : "▸ Show ") + removedAdvisors.length + " removed"),
+        showRemoved && h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border divide-y mt-1.5" },
+          removedAdvisors.map(renderAdvisorRow)
+        )
+      )
     ),
     h("button", { onClick: function () { setShowExport(true); }, style: { borderColor: COLORS.line, color: COLORS.ink }, className: "w-full py-3 rounded-2xl border font-medium text-sm" }, "Export last 60 days as CSV"),
     showExport && h("div", { className: "fixed inset-0 flex items-center justify-center px-5", style: { background: "rgba(8,11,17,0.72)" } },
