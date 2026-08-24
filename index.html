@@ -1731,10 +1731,10 @@ function ManagerView(props) {
             missingToday.map(function (r) { return h("div", { key: r.code, className: "px-4 py-3 text-sm", style: { color: COLORS.ink } }, r.name); })
           )
     ),
-    h("div", null,
+      h("div", null,
       h(SectionTitle, { label: "30-Day Consistency" }),
       h("div", { style: { color: COLORS.slate }, className: "text-[11px] leading-relaxed mb-2.5" },
-        "One box per day, oldest on the left \u2192 today on the right. Gold = full funnel, teal = logged, dim = missed. Faded boxes are weekends \u2014 missing one doesn't count against the " + last30WeekdayCount + " weekdays this window."),
+        "Left to right = last 30 days, oldest to today. Gold = full funnel, teal = logged, dim = missed. Weekends show faded and don't count toward the " + last30WeekdayCount + " weekdays."),
       h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border divide-y" },
         activeAdvisors.length === 0
           ? h("div", { style: { color: COLORS.slate }, className: "p-4 text-sm text-center" }, "No active advisors.")
