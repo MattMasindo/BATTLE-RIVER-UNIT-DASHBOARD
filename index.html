@@ -1665,6 +1665,36 @@ function ManagerView(props) {
   var activeAdvisors = roster.filter(function (r) { return r.active !== false; });
   var removedAdvisors = roster.filter(function (r) { return r.active === false; });
  
+  // 30-day consistency grid: one cell per calendar day (oldest \u2192 today),
+  // built entirely from teamEntries already in memory \u2014 no extra fetch.
+  // Weekends are flagged (not excluded) so a missed Saturday can render
+  // differently from a missed Tuesday, matching the Mon-Fri assumption
+  // already used by currentStreakFrom/bestStreakFrom elsewhere in this file.
+  var last30 = (function () {
+    var days = [];
+    for (var i = 29; i >= 0; i--) {
+      var d = new Date();
+      d.setDate(d.getDate() - i);
+      var dow = d.getDay();
+      days.push({ date: localDateStr(d), weekend: dow === 0 || dow === 6 });
+    }
+    return days;
+  })();
+  var last30WeekdayCount = last30.filter(function (d) { return !d.weekend; }).length;
+  var consistencyStats = function (code) {
+    var byDate = {};
+    teamEntries.forEach(function (e) { if (e.advisor_code === code) byDate[e.entry_date] = e; });
+    var loggedWeekdays = 0;
+    var cells = last30.map(function (day) {
+      var e = byDate[day.date];
+      var lit = entryTotal(e) > 0;
+      var full = isFullFunnel(e);
+      if (lit && !day.weekend) loggedWeekdays++;
+      return { date: day.date, weekend: day.weekend, lit: lit, full: full };
+    });
+    return { cells: cells, loggedWeekdays: loggedWeekdays };
+  };
+ 
   return h("div", { className: "px-5 mt-6 space-y-6" },
     h("div", { className: "flex items-center justify-between" },
       h("div", { style: { color: COLORS.slate }, className: "text-xs font-mono uppercase tracking-wide" }, "Manager view"),
@@ -1700,6 +1730,35 @@ function ManagerView(props) {
         : h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border divide-y" },
             missingToday.map(function (r) { return h("div", { key: r.code, className: "px-4 py-3 text-sm", style: { color: COLORS.ink } }, r.name); })
           )
+    ),
+    h("div", null,
+      h(SectionTitle, { label: "30-Day Consistency" }),
+      h("div", { style: { color: COLORS.slate }, className: "text-[11px] leading-relaxed mb-2.5" },
+        "One box per day, oldest on the left \u2192 today on the right. Gold = full funnel, teal = logged, dim = missed. Faded boxes are weekends \u2014 missing one doesn't count against the " + last30WeekdayCount + " weekdays this window."),
+      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border divide-y" },
+        activeAdvisors.length === 0
+          ? h("div", { style: { color: COLORS.slate }, className: "p-4 text-sm text-center" }, "No active advisors.")
+          : activeAdvisors.map(function (r) {
+              var stats = consistencyStats(r.code);
+              return h("div", { key: r.code, className: "px-4 py-3" },
+                h("div", { className: "flex items-center justify-between mb-2" },
+                  h("div", { style: { color: COLORS.ink }, className: "text-sm font-medium" }, r.name),
+                  h("div", { style: { color: COLORS.slate }, className: "text-[10px] font-mono shrink-0" }, stats.loggedWeekdays + "/" + last30WeekdayCount + " weekdays")
+                ),
+                h("div", { style: { display: "grid", gridTemplateColumns: "repeat(30, 1fr)", gap: "2.5px" } },
+                  stats.cells.map(function (c, idx) {
+                    var bg = c.lit ? (c.full ? COLORS.brass : COLORS.good) : COLORS.line;
+                    var op = (!c.lit && c.weekend) ? 0.35 : 1;
+                    return h("div", {
+                      key: idx,
+                      title: c.date + (c.lit ? (c.full ? " \u2014 full funnel" : " \u2014 logged") : " \u2014 missed"),
+                      style: { background: bg, opacity: op, height: "10px", borderRadius: "2px" }
+                    });
+                  })
+                )
+              );
+            })
+      )
     ),
     h("div", null,
       h("div", { className: "flex items-center justify-between mb-2.5" },
