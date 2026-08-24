@@ -89,6 +89,20 @@ function prettyDate(dateStr) {
 function shortDate(dateStr) {
   return new Date(dateStr + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
+// Seconds-granular "time since" for the auto-logged metrics sync label \u2014
+// deliberately finer-grained than shortDate/fmtAgo-style helpers elsewhere,
+// since the whole point is showing single-digit-second freshness against a
+// 20s poll interval, not a coarse day-level relative time.
+function fmtSyncAgo(ts) {
+  if (!ts) return null;
+  var secs = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (secs < 5) return "just now";
+  if (secs < 60) return secs + "s ago";
+  var mins = Math.floor(secs / 60);
+  if (mins < 60) return mins + "m ago";
+  var hrs = Math.floor(mins / 60);
+  return hrs + "h ago";
+}
 function emptyEntry() {
   var row = { social: false, note: "", fyp: 0 };
   METRICS.forEach(function (m) { row[m.key] = 0; });
@@ -336,6 +350,12 @@ function App() {
   // session).
   var pinRequestRef = useRef(null);
   var myEntriesState = useState({}); var myEntries = myEntriesState[0], setMyEntries = myEntriesState[1];
+  // Timestamp of the last successful refreshMyEntries() call, surfaced to
+  // the advisor as "synced Ns ago" next to the auto-logged metrics \u2014 those
+  // two fields have no tap button, so this is the only way to tell whether
+  // a Script Tool action has actually landed yet, short of shortening the
+  // 20s poll interval itself.
+  var lastSyncedAtState = useState(null); var lastSyncedAt = lastSyncedAtState[0], setLastSyncedAt = lastSyncedAtState[1];
   var teamEntriesState = useState([]); var teamEntries = teamEntriesState[0], setTeamEntries = teamEntriesState[1];
   var referralsState = useState([]); var referrals = referralsState[0], setReferrals = referralsState[1];
   var submissionsState = useState([]); var submissions = submissionsState[0], setSubmissions = submissionsState[1];
@@ -400,6 +420,7 @@ function App() {
     var map = {};
     (er.data || []).forEach(function (row) { map[row.entry_date] = row; });
     setMyEntries(map);
+    setLastSyncedAt(Date.now());
   };
  
   var loadTeamData = async function () {
@@ -489,6 +510,7 @@ function App() {
     var map = {};
     (res.data || []).forEach(function (row) { map[row.entry_date] = row; });
     setMyEntries(map);
+    setLastSyncedAt(Date.now());
   };
  
   function setPendingSelf(p) {
@@ -948,7 +970,8 @@ function App() {
         leaderboard: leaderboard, trendData: trendData, funnelData: funnelData, myCode: myCode, loading: teamLoading,
         onRefresh: function () { loadTeamData(); refreshMyEntries(myCode); },
         myWeekDayLabels: myWeekDayLabels, monthBoards: monthBoards, myReferrals: myReferrals,
-        currentStreak: currentStreak, bestStreak: bestStreak, onAddReferral: function (name) { return addReferral(name, myCode); }
+        currentStreak: currentStreak, bestStreak: bestStreak, onAddReferral: function (name) { return addReferral(name, myCode); },
+        lastSyncedAt: lastSyncedAt
       }),
       view === "manager" && isManager && h(ManagerView, {
         date: today, roster: roster, activeRoster: activeRoster, teamEntries: teamEntries, loading: teamLoading, onRefresh: loadTeamData,
@@ -1303,12 +1326,22 @@ function AdvisorView(props) {
     myCode = props.myCode, loading = props.loading, onRefresh = props.onRefresh,
     myWeekDayLabels = props.myWeekDayLabels || [], monthBoards = props.monthBoards || { pipeline: [], grind: [], grosser: [] },
     myReferrals = props.myReferrals || [], currentStreak = props.currentStreak || 0, bestStreak = props.bestStreak || 0,
-    onAddReferral = props.onAddReferral;
+    onAddReferral = props.onAddReferral, lastSyncedAt = props.lastSyncedAt;
  
   var newRefState = useState(""); var newRefName = newRefState[0], setNewRefName = newRefState[1];
   var refSavingState = useState(false); var refSaving = refSavingState[0], setRefSaving = refSavingState[1];
   var refMsgState = useState(""); var refMsg = refMsgState[0], setRefMsg = refMsgState[1];
   var refOkState = useState(true); var refOk = refOkState[0], setRefOk = refOkState[1];
+ 
+  // Forces a re-render once a second purely so fmtSyncAgo(lastSyncedAt)
+  // recomputes against the current clock \u2014 lastSyncedAt itself only
+  // changes every ~20s (the poll interval), but the "12s ago" label next
+  // to the auto-logged metrics needs to visibly count up in between.
+  var syncTickState = useState(0); var setSyncTick = syncTickState[1];
+  useEffect(function () {
+    var iv = setInterval(function () { setSyncTick(function (t) { return t + 1; }); }, 1000);
+    return function () { clearInterval(iv); };
+  }, []);
  
   // "This week's leaderboard" further down this same screen has no tab or
   // tap to gate a view event behind, so this fires once per advisor per
@@ -1517,16 +1550,23 @@ function AdvisorView(props) {
  
     h("div", null,
       h(SectionTitle, { label: "Log today's activity" }),
-      showNudge && h("div", { style: { background: "rgba(226,75,74,0.12)", borderColor: COLORS.rust, color: COLORS.rust }, className: "rounded-2xl border p-3.5 text-xs mb-3" }, "Nothing logged today yet."),
+      full && h("div", { style: { background: "rgba(45,212,191,0.10)", borderColor: COLORS.good, color: COLORS.good }, className: "rounded-2xl border p-3.5 text-xs mb-3 flex items-center gap-2" },
+        h("span", null, "\u2713"),
+        h("span", null, "Full funnel day \u2014 you're done for today. Anything you log from here is a bonus.")
+      ),
+      !full && showNudge && h("div", { style: { background: "rgba(226,75,74,0.12)", borderColor: COLORS.rust, color: COLORS.rust }, className: "rounded-2xl border p-3.5 text-xs mb-3" }, "Nothing logged today yet."),
       saveError && h("div", { style: { background: "rgba(226,75,74,0.12)", borderColor: COLORS.rust, color: COLORS.rust }, className: "rounded-2xl border p-3 text-xs mb-3" }, "Your last tap may not have saved \u2014 check your connection."),
       h("div", { className: "space-y-3" },
-        METRICS.map(function (m) {
+        (function () {
+          var syncLabel = fmtSyncAgo(lastSyncedAt);
+          return METRICS.map(function (m) {
           var val = entry[m.key] || 0, target = targets[m.key] || 0, hit = target > 0 && val >= target;
           return h("div", { key: m.key, style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4 flex items-center justify-between" },
             h("div", null,
               h("div", { style: { color: COLORS.ink }, className: "font-medium text-sm" }, m.label),
               m.auto
-                ? h("div", { style: { color: COLORS.inkLight }, className: "text-[10px] font-mono mt-0.5" }, "auto \u00b7 from the Script Tool")
+                ? h("div", { style: { color: COLORS.inkLight }, className: "text-[10px] font-mono mt-0.5" },
+                    "auto \u00b7 from the Script Tool" + (syncLabel ? " \u00b7 synced " + syncLabel : ""))
                 : (target > 0 && h("div", { style: { color: hit ? COLORS.good : COLORS.slate }, className: "text-[10px] font-mono mt-0.5" }, "target " + target + (hit ? " \u2713" : "")))
             ),
             m.auto
@@ -1537,7 +1577,8 @@ function AdvisorView(props) {
                   h("button", { onClick: function () { onBump(m.key, 1); }, style: { background: COLORS.emphasis }, className: "w-9 h-9 rounded-full text-white flex items-center justify-center active:scale-95" }, "+")
                 )
           );
-        }),
+          });
+        })(),
         h(SubmissionBox, {
           mySubmissions: mySubmissions, onAddSubmission: onAddSubmission,
           monthSubmittedMine: monthSubmittedMine, monthSettledMine: monthSettledMine
