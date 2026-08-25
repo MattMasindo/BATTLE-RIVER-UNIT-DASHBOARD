@@ -674,7 +674,7 @@ function App() {
       return { ok: false, message: "Couldn't save." };
     }
   };
-
+ 
   var setSubmissionSettled = async function (id, settled) {
     var previous = submissions;
     setSubmissions(submissions.map(function (s) {
@@ -1749,7 +1749,7 @@ function AdvisorView(props) {
   );
 }
  
-
+ 
 // ── AWARD BADGE ──────────────────────────────────────────────────────────
 // Inline SVG badge, no image hosting needed. Tier colour + pip count
 // distinguish the six Medallion tiers, and award_type gives the outer ring.
@@ -1770,7 +1770,7 @@ var TIER_META = {
   // MDRT
   "MDRT": { ring: "#4FB477", fill: "#2A7A50", pips: 1, label: "MDRT" }
 };
-
+ 
 function AwardBadge(props) {
   var tier = props.tier, size = props.size || 22;
   var meta = TIER_META[tier];
@@ -1806,7 +1806,7 @@ function AwardBadge(props) {
     })
   );
 }
-
+ 
 // Picks the highest earned tier for a given advisor + award_type
 // from the full awardProgress array.
 function topTier(awardProgress, advisorCode, awardType) {
@@ -1824,7 +1824,7 @@ function topTier(awardProgress, advisorCode, awardType) {
   });
   return best.current_tier || null;
 }
-
+ 
 function ManagerView(props) {
   var date = props.date, roster = props.roster, activeRoster = props.activeRoster || props.roster, teamEntries = props.teamEntries, loading = props.loading, onRefresh = props.onRefresh,
     missingToday = props.missingToday, loggedTodayCount = props.loggedTodayCount, targets = props.targets, onSaveTargets = props.onSaveTargets,
@@ -1927,18 +1927,59 @@ function ManagerView(props) {
     return days;
   })();
   var last30WeekdayCount = last30.filter(function (d) { return !d.weekend; }).length;
-  var consistencyStats = function (code) {
+ 
+  // An advisor's first day ON THE SYSTEM. Days before this are not misses —
+  // the tool didn't exist for them yet — so they must not be counted in the
+  // denominator or drawn the same colour as a missed day.
+  //
+  // Takes the EARLIEST of (roster created_at, first entry) deliberately. Using
+  // first-entry alone would let someone who joined three weeks ago and logged
+  // once yesterday score 1/1 = perfect, which is a worse lie than the fixed-22
+  // denominator this replaces. created_at is parsed through localDateStr so a
+  // UTC timestamp lands on the right Manila calendar day.
+  var advisorStartDate = function (r) {
+    var candidates = [];
+    if (r.started_on) candidates.push(String(r.started_on).slice(0, 10));
+    if (r.created_at) {
+      var parsed = new Date(r.created_at);
+      if (!isNaN(parsed.getTime())) candidates.push(localDateStr(parsed));
+    }
+    var firstEntry = null;
+    teamEntries.forEach(function (e) {
+      if (e.advisor_code !== r.code) return;
+      if (!firstEntry || e.entry_date < firstEntry) firstEntry = e.entry_date;
+    });
+    if (firstEntry) candidates.push(firstEntry);
+    if (candidates.length === 0) return null;
+    return candidates.sort()[0];
+  };
+ 
+  var consistencyStats = function (r) {
+    var code = r.code;
+    var startStr = advisorStartDate(r);
     var byDate = {};
     teamEntries.forEach(function (e) { if (e.advisor_code === code) byDate[e.entry_date] = e; });
-    var loggedWeekdays = 0;
+    var loggedWeekdays = 0, eligibleWeekdays = 0;
     var cells = last30.map(function (day) {
+      var preTenure = !!startStr && day.date < startStr;
       var e = byDate[day.date];
       var lit = entryTotal(e) > 0;
       var full = isFullFunnel(e);
-      if (lit && !day.weekend) loggedWeekdays++;
-      return { date: day.date, weekend: day.weekend, lit: lit, full: full };
+      if (!day.weekend && !preTenure) {
+        eligibleWeekdays++;
+        if (lit) loggedWeekdays++;
+      }
+      return { date: day.date, weekend: day.weekend, lit: lit, full: full, preTenure: preTenure };
     });
-    return { cells: cells, loggedWeekdays: loggedWeekdays };
+    return {
+      cells: cells,
+      loggedWeekdays: loggedWeekdays,
+      eligibleWeekdays: eligibleWeekdays,
+      startStr: startStr,
+      // "New" until they've had a fair chance at a two-week run. Below this,
+      // a percentage is too noisy to compare against a veteran's.
+      isNew: eligibleWeekdays > 0 && eligibleWeekdays < 10
+    };
   };
  
   return h("div", { className: "px-5 mt-6 space-y-6" },
@@ -1980,19 +2021,44 @@ function ManagerView(props) {
     h("div", null,
       h(SectionTitle, { label: "30-Day Consistency" }),
       h("div", { style: { color: COLORS.slate }, className: "text-[11px] leading-relaxed mb-2.5" },
-        "Left to right = last 30 days, oldest to today. Gold = full funnel, teal = logged, dim = missed. Weekends show faded and don't count toward the " + last30WeekdayCount + " weekdays."),
+        "Left to right = last 30 days, oldest to today. Gold = full funnel, teal = logged, dim = missed, hollow = before they joined. Each advisor is scored only against the weekdays they've actually been on the system, so a new advisor isn't penalised for days that weren't theirs to miss."),
       h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border divide-y" },
         activeAdvisors.length === 0
           ? h("div", { style: { color: COLORS.slate }, className: "p-4 text-sm text-center" }, "No active advisors.")
           : activeAdvisors.map(function (r) {
-              var stats = consistencyStats(r.code);
+              var stats = consistencyStats(r);
+              var pct = stats.eligibleWeekdays > 0
+                ? Math.round((stats.loggedWeekdays / stats.eligibleWeekdays) * 100)
+                : null;
               return h("div", { key: r.code, className: "px-4 py-3" },
-                h("div", { className: "flex items-center justify-between mb-2" },
-                  h("div", { style: { color: COLORS.ink }, className: "text-sm font-medium" }, r.name),
-                  h("div", { style: { color: COLORS.slate }, className: "text-[10px] font-mono shrink-0" }, stats.loggedWeekdays + "/" + last30WeekdayCount + " weekdays")
+                h("div", { className: "flex items-center justify-between gap-2 mb-2" },
+                  h("div", { className: "flex items-center gap-2 min-w-0" },
+                    h("div", { style: { color: COLORS.ink }, className: "text-sm font-medium truncate" }, r.name),
+                    stats.isNew && h("span", {
+                      style: { background: "rgba(45,212,191,0.14)", color: COLORS.good },
+                      className: "text-[9px] font-mono px-1.5 py-0.5 rounded shrink-0"
+                    }, "NEW \u00B7 DAY " + stats.eligibleWeekdays)
+                  ),
+                  h("div", { style: { color: COLORS.slate }, className: "text-[10px] font-mono shrink-0" },
+                    stats.eligibleWeekdays === 0
+                      ? "not started"
+                      : stats.loggedWeekdays + "/" + stats.eligibleWeekdays + " weekdays \u00B7 " + pct + "%")
                 ),
                 h("div", { style: { display: "grid", gridTemplateColumns: "repeat(30, 1fr)", gap: "2.5px" } },
                   stats.cells.map(function (c, idx) {
+                    // Pre-tenure days render hollow, never as the same solid
+                    // grey used for a real miss — that collision is what made
+                    // a three-day-old advisor look like 25 failures.
+                    if (c.preTenure) {
+                      return h("div", {
+                        key: idx,
+                        title: c.date + " \u2014 before they joined",
+                        style: {
+                          background: "transparent", border: "1px solid " + COLORS.line,
+                          opacity: 0.45, height: "10px", borderRadius: "2px", boxSizing: "border-box"
+                        }
+                      });
+                    }
                     var bg = c.lit ? (c.full ? COLORS.brass : COLORS.good) : COLORS.line;
                     var op = (!c.lit && c.weekend) ? 0.35 : 1;
                     return h("div", {
@@ -2742,7 +2808,7 @@ function SubmissionBox(props) {
   );
 }
  
-
+ 
 function ManagerAddSubmissionForm(props) {
   var roster = props.roster || [], onAdd = props.onAdd, onDone = props.onDone;
   var advisorState = useState(""); var advisorCode = advisorState[0], setAdvisorCode = advisorState[1];
@@ -2755,7 +2821,7 @@ function ManagerAddSubmissionForm(props) {
   var errState = useState(""); var err = errState[0], setErr = errState[1];
   var busyState = useState(false); var busy = busyState[0], setBusy = busyState[1];
   var okState = useState(false); var justSaved = okState[0], setJustSaved = okState[1];
-
+ 
   var submit = async function () {
     if (busy) return;
     setErr("");
@@ -2772,10 +2838,10 @@ function ManagerAddSubmissionForm(props) {
     setSubmittedDate(""); setSettledDate("");
     setJustSaved(true); setTimeout(function () { setJustSaved(false); onDone(); }, 1800);
   };
-
+ 
   var inp = { borderColor: COLORS.line, background: COLORS.parchment, color: COLORS.ink };
   var cls = "w-full px-3 py-2.5 rounded-xl border outline-none focus:ring-2 text-sm";
-
+ 
   return h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4 space-y-2 mb-3" },
     h("div", { style: { color: COLORS.slate }, className: "text-[11px] leading-relaxed mb-1" },
       "All fields except client name and settled date are required. If settled date is empty, the policy stays pending."),
@@ -2813,7 +2879,7 @@ function ManagerAddSubmissionForm(props) {
     }, busy ? "Saving…" : "Log submission")
   );
 }
-
+ 
 function SectionTitle(props) {
   return h("div", { className: props.bare ? "" : "mb-2.5" }, h("span", { style: { color: COLORS.ink }, className: "font-display text-base" }, props.label));
 }
