@@ -359,6 +359,7 @@ function App() {
   var teamEntriesState = useState([]); var teamEntries = teamEntriesState[0], setTeamEntries = teamEntriesState[1];
   var referralsState = useState([]); var referrals = referralsState[0], setReferrals = referralsState[1];
   var submissionsState = useState([]); var submissions = submissionsState[0], setSubmissions = submissionsState[1];
+  var awardProgressState = useState([]); var awardProgress = awardProgressState[0], setAwardProgress = awardProgressState[1];
   var teamLoadingState = useState(false); var teamLoading = teamLoadingState[0], setTeamLoading = teamLoadingState[1];
   var viewState = useState("advisor"); var view = viewState[0], setView = viewState[1];
   var switchingState = useState(false); var switching = switchingState[0], setSwitching = switchingState[1];
@@ -434,6 +435,9 @@ function App() {
     setReferrals(results[1].data || []);
     setSubmissions(results[2].data || []);
     setTeamLoading(false);
+    sb.rpc("get_award_progress").then(function(res) {
+      if (res.data) setAwardProgress(res.data);
+    });
   };
  
   var loadRecruitmentData = async function () {
@@ -637,6 +641,40 @@ function App() {
     return { ok: true };
   };
  
+  var addManagerSubmission = async function (advisorCode, serial, clientName, amount, nbAc, submittedDate, settledDate) {
+    try {
+      var pin = await requireManagerPin();
+      var res = await sb.rpc("admin_add_submission", {
+        p_manager_pin: pin,
+        p_advisor_code: advisorCode,
+        p_app_serial: serial,
+        p_client_name: clientName || null,
+        p_amount: parseFloat(amount),
+        p_nb_ac: parseFloat(nbAc),
+        p_submitted_date: submittedDate || null,
+        p_settled_date: settledDate || null
+      });
+      if (res.error || (res.data && !res.data.ok)) {
+        var err = (res.data && res.data.error) || (res.error && res.error.message) || "Couldn't save.";
+        if (err === "bad_pin") return { ok: false, message: "Wrong manager PIN." };
+        if (err === "duplicate_serial") return { ok: false, message: "This serial number is already logged." };
+        if (err === "invalid_amount") return { ok: false, message: "Enter a valid FYP amount." };
+        if (err === "nb_ac_exceeds_amount") return { ok: false, message: "NB AC cannot exceed the FYP amount." };
+        return { ok: false, message: err };
+      }
+      // Reload submissions + award progress
+      var [subRes, apRes] = await Promise.all([
+        sb.from("submissions").select("*").order("submitted_date", { ascending: false }),
+        sb.rpc("get_award_progress")
+      ]);
+      if (subRes.data) setSubmissions(subRes.data);
+      if (apRes.data) setAwardProgress(apRes.data);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, message: "Couldn't save." };
+    }
+  };
+
   var setSubmissionSettled = async function (id, settled) {
     var previous = submissions;
     setSubmissions(submissions.map(function (s) {
@@ -645,6 +683,7 @@ function App() {
     try {
       var pin = await requireManagerPin();
       var res = await sb.rpc("admin_set_submission_settled", { p_manager_pin: pin, p_submission_id: id, p_settled: settled });
+      sb.rpc("get_award_progress").then(function(r) { if (r.data) setAwardProgress(r.data); });
       if (res.error || !(res.data && res.data.ok)) setSubmissions(previous);
     } catch (e) { setSubmissions(previous); }
   };
@@ -904,7 +943,7 @@ function App() {
         h("div", { className: "flex items-center gap-3" },
           h(BattleRiverMark, { size: 34, uid: "aces" }),
           h("div", null,
-            h("div", { style: { color: COLORS.brassLight }, className: "text-[11px] tracking-[0.2em] uppercase font-mono" }, "Battle River \u00b7 v3.0"),
+            h("div", { style: { color: COLORS.brassLight }, className: "text-[11px] tracking-[0.2em] uppercase font-mono" }, "Battle River \u00b7 v3.1"),
             h("div", { className: "font-display text-white text-2xl mt-0.5" }, "Recruitment")
           )
         ),
@@ -948,7 +987,7 @@ function App() {
         h("div", { className: "flex items-center gap-3" },
           h(BattleRiverMark, { size: 34, uid: "hdr" }),
           h("div", null,
-            h("div", { style: { color: COLORS.brassLight }, className: "text-[11px] tracking-[0.2em] uppercase font-mono" }, "Battle River \u00b7 v3.0"),
+            h("div", { style: { color: COLORS.brassLight }, className: "text-[11px] tracking-[0.2em] uppercase font-mono" }, "Battle River \u00b7 v3.1"),
             h("div", { className: "font-display text-white text-2xl mt-0.5" }, myIdentity.name)
           )
         ),
@@ -971,7 +1010,8 @@ function App() {
         onRefresh: function () { loadTeamData(); refreshMyEntries(myCode); },
         myWeekDayLabels: myWeekDayLabels, monthBoards: monthBoards, myReferrals: myReferrals,
         currentStreak: currentStreak, bestStreak: bestStreak, onAddReferral: function (name) { return addReferral(name, myCode); },
-        lastSyncedAt: lastSyncedAt
+        lastSyncedAt: lastSyncedAt,
+        awardProgress: awardProgress
       }),
       view === "manager" && isManager && h(ManagerView, {
         date: today, roster: roster, activeRoster: activeRoster, teamEntries: teamEntries, loading: teamLoading, onRefresh: loadTeamData,
@@ -983,7 +1023,11 @@ function App() {
         onSetAdvisorActive: setAdvisorActive,
         pendingRoster: pendingRoster, onAddAdvisor: managerCreateAdvisor,
         onApproveAdvisor: approveAdvisor, onRejectAdvisor: rejectAdvisor,
-        myCode: myCode
+        myCode: myCode,
+        awardProgress: awardProgress,
+        onAddManagerSubmission: function(advisorCode, serial, clientName, amount, nbAc, submittedDate, settledDate) {
+          return addManagerSubmission(advisorCode, serial, clientName, amount, nbAc, submittedDate, settledDate);
+        }
       }),
       view === "recruitment" && isManager && h(RecruitmentView, {
         readOnly: true, today: today, scorecard: recruitment.scorecard, forumEvents: recruitment.forumEvents,
@@ -1324,6 +1368,7 @@ function AdvisorView(props) {
     todayTotals = props.todayTotals, socialToday = props.socialToday, teamCount = props.teamCount,
     leaderboard = props.leaderboard, trendData = props.trendData, funnelData = props.funnelData,
     myCode = props.myCode, loading = props.loading, onRefresh = props.onRefresh,
+    awardProgress = props.awardProgress || [],
     myWeekDayLabels = props.myWeekDayLabels || [], monthBoards = props.monthBoards || { pipeline: [], grind: [], grosser: [] },
     myReferrals = props.myReferrals || [], currentStreak = props.currentStreak || 0, bestStreak = props.bestStreak || 0,
     onAddReferral = props.onAddReferral, lastSyncedAt = props.lastSyncedAt;
@@ -1612,6 +1657,49 @@ function AdvisorView(props) {
     ),
  
     h("div", null,
+      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4 mb-1" },
+        h("div", { style: { color: COLORS.slate }, className: "text-[10px] font-mono uppercase tracking-wide mb-2" }, "My Recognition"),
+        (function() {
+          var AWARD_TYPES = [
+            { type: "medallion", label: "Medallion" },
+            { type: "macaulay", label: "Macaulay" },
+            { type: "mdrt", label: "MDRT" }
+          ];
+          var hasAny = AWARD_TYPES.some(function(a) {
+            return (awardProgress || []).some(function(p) { return p.advisor_code === myCode && p.award_type === a.type && p.current_tier; });
+          });
+          if (!hasAny) {
+            return h("div", { style: { color: COLORS.slate }, className: "text-[12px]" }, "No tiers earned yet this period. Keep going!");
+          }
+          return h("div", { className: "flex flex-wrap gap-2" },
+            AWARD_TYPES.map(function(a) {
+              var tier = topTier(awardProgress, myCode, a.type);
+              if (!tier) return null;
+              return h("div", { key: a.type, className: "flex items-center gap-1.5" },
+                h(AwardBadge, { tier: tier, size: 24 }),
+                h("span", { style: { color: COLORS.ink }, className: "text-[12px] font-medium" }, tier)
+              );
+            })
+          );
+        })(),
+        (function() {
+          var medalRow = (awardProgress || []).filter(function(p) { return p.advisor_code === myCode && p.award_type === "medallion"; })[0];
+          if (!medalRow || !medalRow.next_tier) return null;
+          var pct = medalRow.next_nb_ac_required
+            ? Math.min(100, Math.round((medalRow.nb_ac / medalRow.next_nb_ac_required) * 100))
+            : 100;
+          return h("div", { className: "mt-3" },
+            h("div", { className: "flex items-center justify-between mb-1" },
+              h("span", { style: { color: COLORS.slate }, className: "text-[10px]" },
+                "Next: " + medalRow.next_tier + " (₱" + Math.ceil(medalRow.nb_ac_gap || 0).toLocaleString() + " to go)"),
+              h("span", { style: { color: COLORS.slate }, className: "text-[10px] font-mono" }, pct + "%")
+            ),
+            h("div", { style: { background: COLORS.line, borderRadius: "4px", height: "4px" } },
+              h("div", { style: { width: pct + "%", background: COLORS.brass, borderRadius: "4px", height: "4px", transition: "width 0.4s" } })
+            )
+          );
+        })()
+      ),
       h(SectionTitle, { label: "Today's funnel" }),
       h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4 space-y-2.5" },
         funnelData.map(function (f) {
@@ -1661,6 +1749,82 @@ function AdvisorView(props) {
   );
 }
  
+
+// ── AWARD BADGE ──────────────────────────────────────────────────────────
+// Inline SVG badge, no image hosting needed. Tier colour + pip count
+// distinguish the six Medallion tiers, and award_type gives the outer ring.
+var TIER_META = {
+  // Medallion
+  "Bronze":     { ring: "#CD7F32", fill: "#8B4513", pips: 1, label: "Bronze" },
+  "Silver":     { ring: "#C0C0C0", fill: "#808080", pips: 2, label: "Silver" },
+  "Gold":       { ring: "#F0B040", fill: "#B8860B", pips: 3, label: "Gold"   },
+  "Platinum 1": { ring: "#8AAEC8", fill: "#4A6E8A", pips: 1, label: "Pt 1"  },
+  "Platinum 2": { ring: "#8AAEC8", fill: "#4A6E8A", pips: 2, label: "Pt 2"  },
+  "Platinum 3": { ring: "#8AAEC8", fill: "#4A6E8A", pips: 3, label: "Pt 3"  },
+  // Macaulay
+  "Bronze Macaulay":       { ring: "#CD7F32", fill: "#8B4513", pips: 1, label: "MAC-B" },
+  "Silver Macaulay":       { ring: "#C0C0C0", fill: "#808080", pips: 2, label: "MAC-S" },
+  "Gold Macaulay":         { ring: "#F0B040", fill: "#B8860B", pips: 3, label: "MAC-G" },
+  "Vice President":        { ring: "#8AAEC8", fill: "#2C3E50", pips: 1, label: "VP"    },
+  "Senior Vice President": { ring: "#8AAEC8", fill: "#1A252F", pips: 2, label: "SVP"   },
+  // MDRT
+  "MDRT": { ring: "#4FB477", fill: "#2A7A50", pips: 1, label: "MDRT" }
+};
+
+function AwardBadge(props) {
+  var tier = props.tier, size = props.size || 22;
+  var meta = TIER_META[tier];
+  if (!meta) return null;
+  var r = size / 2;
+  var pipY = size * 0.72;
+  var pipSpacing = size * 0.22;
+  var pipR = size * 0.065;
+  // Centre pips horizontally
+  var totalPipWidth = (meta.pips - 1) * pipSpacing;
+  var pipStartX = r - totalPipWidth / 2;
+  return h("svg", {
+    viewBox: "0 0 " + size + " " + size,
+    width: size, height: size,
+    style: { display: "inline-block", verticalAlign: "middle", flexShrink: 0 },
+    "aria-label": tier + " award"
+  },
+    h("circle", { cx: r, cy: r, r: r - 1, fill: meta.fill, stroke: meta.ring, strokeWidth: size * 0.09 }),
+    h("text", {
+      x: r, y: size * 0.52,
+      textAnchor: "middle", dominantBaseline: "middle",
+      fontSize: size * 0.28, fontWeight: "700", fill: meta.ring,
+      fontFamily: "IBM Plex Mono, monospace", letterSpacing: "-0.5"
+    }, meta.label),
+    Array.from({ length: meta.pips }).map(function (_, i) {
+      return h("circle", {
+        key: i,
+        cx: pipStartX + i * pipSpacing,
+        cy: pipY,
+        r: pipR,
+        fill: meta.ring
+      });
+    })
+  );
+}
+
+// Picks the highest earned tier for a given advisor + award_type
+// from the full awardProgress array.
+function topTier(awardProgress, advisorCode, awardType) {
+  var ORDER = [
+    "Bronze","Silver","Gold","Platinum 1","Platinum 2","Platinum 3",
+    "Bronze Macaulay","Silver Macaulay","Gold Macaulay","Vice President","Senior Vice President",
+    "MDRT"
+  ];
+  var rows = (awardProgress || []).filter(function(p) {
+    return p.advisor_code === advisorCode && p.award_type === awardType && p.current_tier;
+  });
+  if (!rows.length) return null;
+  var best = rows.reduce(function(a, b) {
+    return ORDER.indexOf(b.current_tier) > ORDER.indexOf(a.current_tier) ? b : a;
+  });
+  return best.current_tier || null;
+}
+
 function ManagerView(props) {
   var date = props.date, roster = props.roster, activeRoster = props.activeRoster || props.roster, teamEntries = props.teamEntries, loading = props.loading, onRefresh = props.onRefresh,
     missingToday = props.missingToday, loggedTodayCount = props.loggedTodayCount, targets = props.targets, onSaveTargets = props.onSaveTargets,
@@ -1668,10 +1832,14 @@ function ManagerView(props) {
     onSetAdvisorActive = props.onSetAdvisorActive, onDeleteReferral = props.onDeleteReferral,
     submissions = props.submissions || [], onSetSubmissionSettled = props.onSetSubmissionSettled,
     onDeleteSubmission = props.onDeleteSubmission,
+    awardProgress = props.awardProgress || [],
+    onAddManagerSubmission = props.onAddManagerSubmission,
     pendingRoster = props.pendingRoster || [], onAddAdvisor = props.onAddAdvisor,
     onApproveAdvisor = props.onApproveAdvisor, onRejectAdvisor = props.onRejectAdvisor,
     myCode = props.myCode;
   var selectedState = useState(null); var selected = selectedState[0], setSelected = selectedState[1];
+  var showAddSubState = useState(false); var showAddSub = showAddSubState[0], setShowAddSub = showAddSubState[1];
+  var recTabState = useState("medallion"); var recTab = recTabState[0], setRecTab = recTabState[1];
   var addAdvisorState = useState(false); var showAddAdvisor = addAdvisorState[0], setShowAddAdvisor = addAdvisorState[1];
   var editState = useState(false); var editingTargets = editState[0], setEditingTargets = editState[1];
   var draftState = useState(targets); var draft = draftState[0], setDraft = draftState[1];
@@ -1925,6 +2093,83 @@ function ManagerView(props) {
           )
         );
       })()
+    ),
+    h("div", null,
+      h(SectionTitle, { label: "Add Submission (Manager)" }),
+      h("div", { className: "flex items-center justify-between mb-2" },
+        h("div", { style: { color: COLORS.slate }, className: "text-[11px] leading-relaxed" },
+          "Log a policy on behalf of an advisor. Serial must be unique per advisor."),
+        h("button", {
+          onClick: function () { setShowAddSub(!showAddSub); },
+          style: { color: COLORS.brass }, className: "text-xs font-mono shrink-0 ml-2"
+        }, showAddSub ? "cancel" : "+ add")
+      ),
+      showAddSub && h(ManagerAddSubmissionForm, {
+        roster: activeRoster,
+        onAdd: onAddManagerSubmission,
+        onDone: function () { setShowAddSub(false); },
+        colors: COLORS
+      })
+    ),
+    h("div", null,
+      h(SectionTitle, { label: "Recognition" }),
+      h("div", { style: { color: COLORS.slate }, className: "text-[11px] leading-relaxed mb-2.5" },
+        "NB AC and app counts from settled policies and seed adjustments. Resets: Medallion per quarter, Macaulay every July, MDRT every January."),
+      h("div", { className: "flex gap-2 mb-3" },
+        ["medallion","macaulay","mdrt"].map(function(tab) {
+          var labels = { medallion: "Medallion", macaulay: "Macaulay", mdrt: "MDRT" };
+          return h("button", {
+            key: tab,
+            onClick: function () { setRecTab(tab); },
+            style: {
+              background: recTab === tab ? COLORS.brass : COLORS.card,
+              color: recTab === tab ? "white" : COLORS.slate,
+              borderColor: COLORS.line
+            },
+            className: "px-3 py-1.5 rounded-full border text-xs font-medium"
+          }, labels[tab]);
+        })
+      ),
+      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border divide-y" },
+        (function() {
+          var rows = (awardProgress || []).filter(function(p) { return p.award_type === recTab; });
+          if (!rows.length) return h("div", { style: { color: COLORS.slate }, className: "p-4 text-sm text-center" }, "No data yet.");
+          return rows.map(function(p) {
+            var pct = p.next_nb_ac_required
+              ? Math.min(100, Math.round((p.nb_ac / p.next_nb_ac_required) * 100))
+              : 100;
+            var gapAC = p.nb_ac_gap > 0 ? ("₱" + Math.ceil(p.nb_ac_gap).toLocaleString() + " NB AC to go") : "";
+            var gapApps = p.apps_gap > 0 ? (p.apps_gap + " apps to go") : "";
+            var gapLabel = [gapAC, gapApps].filter(Boolean).join(" · ");
+            return h("div", { key: p.advisor_code, className: "px-4 py-3" },
+              h("div", { className: "flex items-center justify-between mb-1.5" },
+                h("div", { className: "flex items-center gap-2 min-w-0" },
+                  p.current_tier && h(AwardBadge, { tier: p.current_tier, size: 20 }),
+                  h("span", { style: { color: COLORS.ink }, className: "font-medium text-sm truncate" }, p.advisor_name)
+                ),
+                h("div", { className: "text-right shrink-0 ml-2" },
+                  h("div", { style: { color: COLORS.brass }, className: "font-mono text-xs font-semibold" },
+                    "₱" + Math.round(p.nb_ac || 0).toLocaleString()),
+                  p.award_type === "macaulay" && h("div", { style: { color: COLORS.slate }, className: "text-[10px] font-mono" },
+                    (p.apps_count || 0) + " apps")
+                )
+              ),
+              h("div", { className: "flex items-center gap-1.5 mb-1" },
+                h("div", { style: { flex: 1, background: COLORS.line, borderRadius: "4px", height: "4px" } },
+                  h("div", { style: { width: pct + "%", background: p.current_tier ? COLORS.brass : COLORS.good, borderRadius: "4px", height: "4px", transition: "width 0.4s" } })
+                ),
+                h("span", { style: { color: COLORS.slate }, className: "text-[10px] font-mono shrink-0" }, pct + "%")
+              ),
+              h("div", { className: "flex items-center justify-between" },
+                h("span", { style: { color: COLORS.slate }, className: "text-[10px]" },
+                  p.current_tier ? ("Tier: " + p.current_tier) : "Not yet qualified"),
+                p.next_tier && h("span", { style: { color: COLORS.muted || COLORS.slate }, className: "text-[10px]" },
+                  "Next: " + p.next_tier + (gapLabel ? " — " + gapLabel : ""))
+              )
+            );
+          });
+        })()
+      )
     ),
     h("div", null,
       h(SectionTitle, { label: "Monthly Leaderboard" }),
@@ -2497,6 +2742,78 @@ function SubmissionBox(props) {
   );
 }
  
+
+function ManagerAddSubmissionForm(props) {
+  var roster = props.roster || [], onAdd = props.onAdd, onDone = props.onDone;
+  var advisorState = useState(""); var advisorCode = advisorState[0], setAdvisorCode = advisorState[1];
+  var serialState = useState(""); var serial = serialState[0], setSerial = serialState[1];
+  var clientState = useState(""); var clientName = clientState[0], setClientName = clientState[1];
+  var amtState = useState(""); var amount = amtState[0], setAmount = amtState[1];
+  var nbAcState = useState(""); var nbAc = nbAcState[0], setNbAc = nbAcState[1];
+  var subDateState = useState(""); var submittedDate = subDateState[0], setSubmittedDate = subDateState[1];
+  var setDateState = useState(""); var settledDate = setDateState[0], setSettledDate = setDateState[1];
+  var errState = useState(""); var err = errState[0], setErr = errState[1];
+  var busyState = useState(false); var busy = busyState[0], setBusy = busyState[1];
+  var okState = useState(false); var justSaved = okState[0], setJustSaved = okState[1];
+
+  var submit = async function () {
+    if (busy) return;
+    setErr("");
+    if (!advisorCode) { setErr("Select an advisor."); return; }
+    if (!serial.trim()) { setErr("Enter the APP serial number."); return; }
+    if (!(parseFloat(amount) > 0)) { setErr("Enter a valid FYP amount."); return; }
+    if (!(parseFloat(nbAc) >= 0)) { setErr("Enter a valid NB AC amount."); return; }
+    setBusy(true);
+    var res = await onAdd(advisorCode, serial.trim(), clientName.trim() || null,
+      amount, nbAc, submittedDate || null, settledDate || null);
+    setBusy(false);
+    if (!res || !res.ok) { setErr((res && res.message) || "Couldn't save."); return; }
+    setSerial(""); setClientName(""); setAmount(""); setNbAc("");
+    setSubmittedDate(""); setSettledDate("");
+    setJustSaved(true); setTimeout(function () { setJustSaved(false); onDone(); }, 1800);
+  };
+
+  var inp = { borderColor: COLORS.line, background: COLORS.parchment, color: COLORS.ink };
+  var cls = "w-full px-3 py-2.5 rounded-xl border outline-none focus:ring-2 text-sm";
+
+  return h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4 space-y-2 mb-3" },
+    h("div", { style: { color: COLORS.slate }, className: "text-[11px] leading-relaxed mb-1" },
+      "All fields except client name and settled date are required. If settled date is empty, the policy stays pending."),
+    h("select", {
+      value: advisorCode,
+      onChange: function(ev) { setAdvisorCode(ev.target.value); },
+      style: Object.assign({}, inp, { background: COLORS.parchment }),
+      className: cls
+    },
+      h("option", { value: "" }, "Select advisor…"),
+      roster.map(function(r) { return h("option", { key: r.code, value: r.code }, r.name); })
+    ),
+    h("input", { value: serial, onChange: function(ev){setSerial(ev.target.value);}, placeholder: "APP serial number", style: inp, className: cls + " font-mono" }),
+    h("input", { value: clientName, onChange: function(ev){setClientName(ev.target.value);}, placeholder: "Client name (optional)", style: inp, className: cls }),
+    h("div", { className: "flex gap-2" },
+      h("input", { type: "number", value: amount, onChange: function(ev){setAmount(ev.target.value);}, placeholder: "FYP amount (₱)", style: inp, className: cls + " font-mono" }),
+      h("input", { type: "number", value: nbAc, onChange: function(ev){setNbAc(ev.target.value);}, placeholder: "NB AC (₱)", style: inp, className: cls + " font-mono" })
+    ),
+    h("div", { className: "flex gap-2" },
+      h("div", { className: "flex-1" },
+        h("div", { style: { color: COLORS.slate }, className: "text-[10px] font-mono uppercase tracking-wide mb-1" }, "Submitted date"),
+        h("input", { type: "date", value: submittedDate, onChange: function(ev){setSubmittedDate(ev.target.value);}, style: inp, className: cls + " font-mono text-xs" })
+      ),
+      h("div", { className: "flex-1" },
+        h("div", { style: { color: COLORS.slate }, className: "text-[10px] font-mono uppercase tracking-wide mb-1" }, "Settled date (optional)"),
+        h("input", { type: "date", value: settledDate, onChange: function(ev){setSettledDate(ev.target.value);}, style: inp, className: cls + " font-mono text-xs" })
+      )
+    ),
+    err && h("div", { style: { color: COLORS.rust }, className: "text-xs" }, err),
+    justSaved && h("div", { style: { color: COLORS.good }, className: "text-xs" }, "Submission logged — mark settled in FYP Verification if approved."),
+    h("button", {
+      onClick: submit, disabled: busy,
+      style: { background: busy ? COLORS.line : COLORS.emphasis, opacity: busy ? 0.7 : 1 },
+      className: "w-full py-2.5 rounded-xl text-white text-sm font-semibold active:scale-[0.98] transition-transform"
+    }, busy ? "Saving…" : "Log submission")
+  );
+}
+
 function SectionTitle(props) {
   return h("div", { className: props.bare ? "" : "mb-2.5" }, h("span", { style: { color: COLORS.ink }, className: "font-display text-base" }, props.label));
 }
