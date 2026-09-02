@@ -25,6 +25,32 @@
   .font-mono { font-family: 'IBM Plex Mono', monospace; }
   @keyframes pop { 0% { transform: scale(1); } 40% { transform: scale(1.12); } 100% { transform: scale(1); } }
   .pop { animation: pop 0.4s ease; }
+
+  /* ---- Rule 7: zero-blank-screen. Skeletons, spinners, progress bars. --- */
+  @keyframes shimmer { 0% { background-position: -420px 0; } 100% { background-position: 420px 0; } }
+  .skel {
+    background: linear-gradient(90deg, #1B2231 0%, #263049 42%, #1B2231 84%);
+    background-size: 420px 100%;
+    animation: shimmer 1.25s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spin { animation: spin 0.7s linear infinite; }
+  @keyframes indeterminate { 0% { left: -35%; width: 35%; } 60% { left: 100%; width: 35%; } 100% { left: 100%; width: 35%; } }
+  .bar-indeterminate { position: absolute; top: 0; bottom: 0; border-radius: 999px; animation: indeterminate 1.15s ease-in-out infinite; }
+
+  /* ---- Rule 14: bottom sheet ------------------------------------------- */
+  @keyframes sheetIn { from { transform: translateY(100%); } to { transform: translateY(0); } }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  .sheet-in { animation: sheetIn 0.24s cubic-bezier(0.32, 0.72, 0, 1); }
+  .fade-in { animation: fadeIn 0.18s ease; }
+  .sheet-grab { touch-action: none; }
+
+  /* Bottom tab bar is fixed, so every scrollable page reserves room for it. */
+  .has-bottom-nav { padding-bottom: calc(70px + env(safe-area-inset-bottom)); }
+
+  @media (prefers-reduced-motion: reduce) {
+    .skel, .spin, .bar-indeterminate, .sheet-in, .fade-in, .pop { animation: none !important; }
+  }
 </style>
 </head>
 <body>
@@ -322,6 +348,657 @@ async function verifyAdvisorPin(advisorId, pin) {
   } catch (e) { return { error: "Couldn't reach the server \u2014 try again." }; }
 }
  
+// ======================================================================
+// UX KIT — Jakob's Law chrome plus the ten hard interaction rules.
+//
+// Everything below is presentation and interaction only. No business
+// logic, no payout maths, no Supabase writes live in this block; the
+// existing computation functions above are untouched.
+// ======================================================================
+
+var UX = {
+  pageSize: 12,            // rule 10 — rows added per incremental page
+  prefetchMargin: "700px", // rule 10 — sentinel fires this far ABOVE the fold
+  dragCloseDistance: 110,  // rule 14 — px of downward drag that dismisses
+  dragCloseVelocity: 0.55  // rule 14 — px/ms flick that dismisses regardless
+};
+
+// ---------------------------------------------------------------------
+// RULE 15 — deep linking.
+// The whole app state that is worth sharing lives in the query string:
+//   ?view=manager&advisor=136662&sheet=export&lane=grosser&q=cecille
+// The hash form (#?view=...) is read as a fallback because some chat
+// clients strip query strings from shared links but keep the fragment.
+// A link always resolves to the exact entity — never the generic home.
+// ---------------------------------------------------------------------
+var VIEW_KEYS = ["today", "team", "rewards", "manager", "recruitment"];
+
+function parseRoute() {
+  var out = { view: null, advisor: null, sheet: null, lane: null, q: null };
+  try {
+    var qs = window.location.search || "";
+    if (qs.length < 2 && (window.location.hash || "").indexOf("?") !== -1) {
+      qs = window.location.hash.slice(window.location.hash.indexOf("?"));
+    }
+    var p = new URLSearchParams(qs);
+    var v = (p.get("view") || "").toLowerCase();
+    if (v === "advisor") v = "today";       // legacy links from v3.1 and earlier
+    if (VIEW_KEYS.indexOf(v) !== -1) out.view = v;
+    out.advisor = p.get("advisor") || null;
+    out.sheet = p.get("sheet") || null;
+    out.lane = p.get("lane") || null;
+    out.q = p.get("q") || null;
+  } catch (e) {}
+  return out;
+}
+
+function routeToUrl(route) {
+  var p = new URLSearchParams();
+  ["view", "advisor", "sheet", "lane", "q"].forEach(function (k) {
+    if (route[k]) p.set(k, route[k]);
+  });
+  var s = p.toString();
+  return s ? (window.location.pathname + "?" + s) : window.location.pathname;
+}
+
+// push = a real history entry, so the browser/hardware Back button steps
+// back exactly one screen — the same contract the ← button honours.
+function writeRoute(route, push) {
+  try {
+    var url = routeToUrl(route);
+    if (push) window.history.pushState(route, "", url);
+    else window.history.replaceState(route, "", url);
+  } catch (e) {}
+}
+
+// ---------------------------------------------------------------------
+// RULE 12 — state & draft auto-saving.
+// Anything typed is written to localStorage on every keystroke, keyed so
+// a different advisor (or a different day) never inherits someone else's
+// half-finished text. Drafts are cleared only on a successful save.
+// ---------------------------------------------------------------------
+function draftGet(key, fallback) {
+  var v = lget("br-draft-" + key);
+  return (v === null || v === undefined) ? fallback : v;
+}
+function draftSet(key, val) { lset("br-draft-" + key, val); }
+function draftClear(key) { try { localStorage.removeItem("br-draft-" + key); } catch (e) {} }
+
+function useDraft(key, initial) {
+  var st = useState(function () { return draftGet(key, initial); });
+  var val = st[0], set = st[1];
+  var keyRef = useRef(key);
+  useEffect(function () {
+    if (keyRef.current === key) return;   // first run already loaded it
+    keyRef.current = key;
+    set(draftGet(key, initial));
+    // eslint-disable-next-line
+  }, [key]);
+  function setAndSave(next) { set(next); draftSet(key, next); }
+  function clear() { draftClear(key); set(initial); }
+  return [val, setAndSave, clear];
+}
+
+// Multi-field form draft (one localStorage key holding an object).
+function useDraftForm(key, initial) {
+  function load(k, base) {
+    var saved = draftGet(k, null);
+    return saved && typeof saved === "object" ? Object.assign({}, base, saved) : Object.assign({}, base);
+  }
+  var st = useState(function () { return load(key, initial); });
+  var val = st[0], set = st[1];
+  var keyRef = useRef(key);
+  useEffect(function () {
+    if (keyRef.current === key) return;
+    keyRef.current = key;
+    set(load(key, initial));
+    // eslint-disable-next-line
+  }, [key]);
+  function patch(fields) {
+    var next = Object.assign({}, val, fields);
+    set(next); draftSet(key, next);
+  }
+  function clear() { draftClear(key); set(Object.assign({}, initial)); }
+  return [val, patch, clear];
+}
+
+// ---------------------------------------------------------------------
+// RULE 10 — proactive infinite scrolling.
+// The sentinel is observed with a large rootMargin, so the next page is
+// mounted while it is still ~700px below the viewport. The user never
+// reaches the bottom of a list and waits.
+// RULE 8 (partly) — how many rows were unrolled is remembered per list,
+// so coming back to a feed restores the same amount of content, which is
+// what makes restoring the scroll pixel position actually land.
+// ---------------------------------------------------------------------
+var listMemory = {};
+
+function useIncremental(total, step, resetKey, memoryKey) {
+  step = step || UX.pageSize;
+  var st = useState(function () {
+    var remembered = memoryKey ? listMemory[memoryKey] : null;
+    return Math.max(step, remembered || step);
+  });
+  var count = st[0], setCount = st[1];
+  var ref = useRef(null);
+  var firstRef = useRef(true);
+
+  // A changed filter (search text, tab) is a new list — start it over.
+  useEffect(function () {
+    if (firstRef.current) { firstRef.current = false; return; }
+    setCount(step);
+    // eslint-disable-next-line
+  }, [resetKey]);
+
+  useEffect(function () {
+    if (memoryKey) listMemory[memoryKey] = count;
+  }, [count, memoryKey]);
+
+  useEffect(function () {
+    var node = ref.current;
+    if (!node || count >= total) return;
+    if (typeof IntersectionObserver === "undefined") {
+      // Old browser: fall back to a throttled scroll listener rather than
+      // dumping the whole list, so behaviour degrades but never breaks.
+      var pending = false;
+      var onScroll = function () {
+        if (pending) return;
+        pending = true;
+        setTimeout(function () {
+          pending = false;
+          var r = node.getBoundingClientRect();
+          if (r.top < window.innerHeight + 700) setCount(function (c) { return Math.min(total, c + step); });
+        }, 120);
+      };
+      window.addEventListener("scroll", onScroll, { passive: true });
+      onScroll();
+      return function () { window.removeEventListener("scroll", onScroll); };
+    }
+    var io = new IntersectionObserver(function (entries) {
+      if (entries[0] && entries[0].isIntersecting) {
+        setCount(function (c) { return Math.min(total, c + step); });
+      }
+    }, { root: null, rootMargin: UX.prefetchMargin, threshold: 0 });
+    io.observe(node);
+    return function () { io.disconnect(); };
+  }, [count, total, step]);
+
+  return {
+    count: Math.min(count, total),
+    hasMore: count < total,
+    // Render this immediately after the list. It is the pre-fetch trigger.
+    sentinel: count < total
+      ? h("div", { ref: ref, className: "px-4 py-3 space-y-2", "aria-hidden": "true" },
+          h(Skeleton, { h: "12px", w: "52%" }),
+          h(Skeleton, { h: "9px", w: "34%" })
+        )
+      : h("div", { ref: ref, style: { height: "1px" } })
+  };
+}
+
+// ---------------------------------------------------------------------
+// RULE 8 — scroll position retention.
+// Every top-level destination remembers its own scrollY. Leaving a feed
+// stores the exact pixel offset; returning restores it across two frames
+// (one for React to paint, one for fonts/images to settle).
+// ---------------------------------------------------------------------
+var scrollMemory = {};
+
+function useScrollMemory(key, ready) {
+  useEffect(function () {
+    if (!ready) return;
+    var remembered = scrollMemory[key];
+    var target = (typeof remembered === "number" && remembered > 0) ? remembered : 0;
+    var userMoved = false;
+
+    // Restoring on one frame isn't enough: paged lists, fonts and charts
+    // all change the document height after the first paint, and the browser
+    // silently clamps a scroll past the current bottom. So we re-apply for
+    // a few frames until it actually lands — and stop the moment the person
+    // scrolls themselves, because their intent outranks the restore.
+    var deadline = Date.now() + 900;
+    function attemptRestore() {
+      if (userMoved) return;
+      if (Math.abs((window.scrollY || 0) - target) > 2) window.scrollTo(0, target);
+      if (Math.abs((window.scrollY || 0) - target) <= 2) return;   // landed
+      if (Date.now() > deadline) return;                            // give up, don't fight
+      requestAnimationFrame(attemptRestore);
+    }
+    requestAnimationFrame(attemptRestore);
+    var settle = setTimeout(attemptRestore, 160);
+    var settle2 = setTimeout(attemptRestore, 420);
+
+    var ticking = false;
+    function onScroll() {
+      if (ticking) return;
+      ticking = true;
+      requestAnimationFrame(function () {
+        ticking = false;
+        scrollMemory[key] = window.scrollY || window.pageYOffset || 0;
+      });
+    }
+    function onManual() { userMoved = true; }
+    window.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("wheel", onManual, { passive: true });
+    window.addEventListener("touchstart", onManual, { passive: true });
+    return function () {
+      clearTimeout(settle); clearTimeout(settle2);
+      scrollMemory[key] = window.scrollY || window.pageYOffset || 0;
+      window.removeEventListener("scroll", onScroll);
+      window.removeEventListener("wheel", onManual);
+      window.removeEventListener("touchstart", onManual);
+    };
+  }, [key, ready]);
+}
+
+function scrollToTop(smooth) {
+  try { window.scrollTo({ top: 0, behavior: smooth === false ? "auto" : "smooth" }); }
+  catch (e) { window.scrollTo(0, 0); }
+}
+
+// ---------------------------------------------------------------------
+// RULE 7 — loading affordances. Never an empty container.
+// ---------------------------------------------------------------------
+function Skeleton(props) {
+  return h("div", {
+    className: "skel " + (props.className || ""),
+    style: Object.assign({
+      height: props.h || "14px",
+      width: props.w || "100%",
+      borderRadius: props.r || "6px"
+    }, props.style || {})
+  });
+}
+
+function SkeletonCard(props) {
+  var lines = props.lines || 3, arr = [];
+  for (var i = 0; i < lines; i++) arr.push(i);
+  return h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4 space-y-2.5" },
+    arr.map(function (i) {
+      return h(Skeleton, { key: i, h: i === 0 ? "17px" : "11px", w: i === 0 ? "56%" : (i % 2 ? "90%" : "70%") });
+    })
+  );
+}
+
+function SkeletonList(props) {
+  var n = props.rows || 4, arr = [];
+  for (var i = 0; i < n; i++) arr.push(i);
+  return h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border divide-y" },
+    arr.map(function (i) {
+      return h("div", { key: i, style: { borderColor: COLORS.line }, className: "px-4 py-3.5 flex items-center gap-3" },
+        h(Skeleton, { h: "24px", w: "24px", r: "50%" }),
+        h("div", { className: "flex-1 space-y-1.5" },
+          h(Skeleton, { h: "12px", w: (38 + (i % 3) * 14) + "%" }),
+          h(Skeleton, { h: "9px", w: "26%" })
+        ),
+        h(Skeleton, { h: "12px", w: "40px" })
+      );
+    })
+  );
+}
+
+function Spinner(props) {
+  var s = props.size || 15;
+  return h("span", {
+    "aria-hidden": "true",
+    className: "spin",
+    style: {
+      width: s + "px", height: s + "px", borderRadius: "50%", display: "inline-block",
+      border: "2px solid rgba(255,255,255,0.3)", borderTopColor: props.color || "#fff",
+      verticalAlign: "-2px"
+    }
+  });
+}
+
+// Indeterminate progress bar for refreshes that replace visible content.
+function ProgressBar(props) {
+  if (!props.active) return null;
+  return h("div", {
+    role: "progressbar", "aria-label": props.label || "Loading",
+    style: { background: COLORS.line, height: "3px", borderRadius: "999px", position: "relative", overflow: "hidden" },
+    className: props.className || ""
+  }, h("div", { className: "bar-indeterminate", style: { background: COLORS.brass } }));
+}
+
+// A button that can never look inert while it is working.
+function BusyButton(props) {
+  var busy = !!props.busy;
+  return h("button", {
+    onClick: props.onClick,
+    disabled: busy || props.disabled,
+    type: "button",
+    style: Object.assign({ background: COLORS.emphasis, opacity: (busy || props.disabled) ? 0.75 : 1 }, props.style || {}),
+    className: props.className || "w-full py-3 rounded-2xl text-white font-medium active:scale-[0.98] transition-transform"
+  },
+    busy
+      ? h("span", { className: "flex items-center justify-center gap-2" }, h(Spinner, null), h("span", null, props.busyLabel || "Saving\u2026"))
+      : props.label
+  );
+}
+
+// ---------------------------------------------------------------------
+// RULE 6 — dismissal. One ✕ closes; one ← goes back exactly one screen.
+// Both are real buttons with labels, so they are reachable by keyboard
+// and by screen readers, not just by tap.
+// ---------------------------------------------------------------------
+function RoundIcon(props) {
+  return h("button", {
+    type: "button",
+    onClick: props.onClick,
+    "aria-label": props.label,
+    title: props.label,
+    style: { color: props.color || COLORS.slate, borderColor: COLORS.line, background: props.background || "transparent" },
+    className: "w-9 h-9 rounded-full border flex items-center justify-center text-[15px] leading-none shrink-0 active:scale-95 transition-transform"
+  }, props.glyph);
+}
+function CloseButton(props) { return h(RoundIcon, { onClick: props.onClick, label: props.label || "Close", glyph: "\u2715" }); }
+function BackButton(props) { return h(RoundIcon, { onClick: props.onClick, label: props.label || "Back", glyph: "\u2190" }); }
+
+function useEscape(handler, active) {
+  var ref = useRef(handler);
+  ref.current = handler;
+  useEffect(function () {
+    if (active === false) return;
+    function onKey(ev) { if (ev.key === "Escape" || ev.key === "Esc") ref.current(); }
+    window.addEventListener("keydown", onKey);
+    return function () { window.removeEventListener("keydown", onKey); };
+  }, [active]);
+}
+
+// ---------------------------------------------------------------------
+// RULE 14 — bottom sheet mechanics.
+// Opens from the bottom, tracks the pointer 1:1 on a downward drag, and
+// dismisses on either distance or flick velocity. Dragging is only armed
+// from the grabber/header, or when the sheet's own content is already
+// scrolled to the top — otherwise a swipe scrolls the content, which is
+// what every native sheet does.
+// ---------------------------------------------------------------------
+function BottomSheet(props) {
+  var onClose = props.onClose, onBack = props.onBack;
+  var dragState = useState(0); var dragY = dragState[0], setDragY = dragState[1];
+  var draggingState = useState(false); var dragging = draggingState[0], setDragging = draggingState[1];
+  var closingRef = useRef(false);
+  var startRef = useRef(null);
+  var bodyRef = useRef(null);
+
+  function close() {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    setDragging(false);
+    setDragY(window.innerHeight);
+    setTimeout(function () { onClose(); }, 190);
+  }
+
+  useEscape(close, true);
+
+  // Freeze the feed behind the sheet so a swipe can't scroll both.
+  useEffect(function () {
+    var prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return function () { document.body.style.overflow = prev; };
+  }, []);
+
+  // A drag must never start on a control. Capturing the pointer on the
+  // header retargets everything that follows to the header, which silently
+  // swallows the click on the ✕ sitting inside it — the close button looks
+  // present and hit-testable but does nothing.
+  function isInteractive(el) {
+    var depth = 0;
+    while (el && el.getAttribute && depth < 8) {
+      var t = (el.tagName || "").toLowerCase();
+      if (t === "button" || t === "a" || t === "input" || t === "textarea" || t === "select" || t === "label") return true;
+      if (el.getAttribute("role") === "button") return true;
+      el = el.parentNode; depth++;
+    }
+    return false;
+  }
+  function armed(ev) {
+    if (isInteractive(ev.target)) return false;
+    if (ev.currentTarget && ev.currentTarget.getAttribute("data-grab") === "1") return true;
+    var b = bodyRef.current;
+    return !b || b.scrollTop <= 0;
+  }
+  function down(ev) {
+    if (closingRef.current || !armed(ev)) return;
+    startRef.current = { y: ev.clientY, t: Date.now() };
+    setDragging(true);
+    try { ev.currentTarget.setPointerCapture(ev.pointerId); } catch (e) {}
+  }
+  function move(ev) {
+    if (!startRef.current) return;
+    var dy = ev.clientY - startRef.current.y;
+    if (dy < 0) dy = dy / 4;          // rubber-band, never lifts off the top
+    setDragY(dy);
+  }
+  function up(ev) {
+    if (!startRef.current) return;
+    var dy = ev.clientY - startRef.current.y;
+    var dt = Math.max(1, Date.now() - startRef.current.t);
+    startRef.current = null;
+    setDragging(false);
+    if (dy > UX.dragCloseDistance || (dy > 24 && dy / dt > UX.dragCloseVelocity)) close();
+    else setDragY(0);
+  }
+
+  var dragHandlers = { onPointerDown: down, onPointerMove: move, onPointerUp: up, onPointerCancel: up };
+  var backdropOpacity = Math.max(0, 0.72 - (dragY / (window.innerHeight || 800)) * 0.6);
+
+  return h("div", {
+    className: "fixed inset-0 z-50 flex items-end justify-center",
+    role: "dialog", "aria-modal": "true", "aria-label": props.title || "Options"
+  },
+    h("div", {
+      onClick: close,
+      className: "absolute inset-0 fade-in",
+      style: { background: "rgba(8,11,17," + backdropOpacity.toFixed(3) + ")" }
+    }),
+    h("div", {
+      className: "relative w-full max-w-md sheet-in",
+      style: {
+        background: COLORS.card,
+        borderTopLeftRadius: "26px", borderTopRightRadius: "26px",
+        transform: "translateY(" + dragY + "px)",
+        transition: dragging ? "none" : "transform 0.19s cubic-bezier(0.32,0.72,0,1)",
+        maxHeight: "88vh", display: "flex", flexDirection: "column",
+        boxShadow: "0 -18px 44px rgba(0,0,0,0.45)",
+        paddingBottom: "env(safe-area-inset-bottom)"
+      }
+    },
+      // Grabber — always drag-armed, the way a native sheet behaves.
+      h("div", Object.assign({ "data-grab": "1", className: "sheet-grab pt-2.5 pb-1 flex justify-center cursor-grab" }, dragHandlers),
+        h("div", { style: { width: "42px", height: "4px", borderRadius: "999px", background: COLORS.line } })
+      ),
+      h("div", Object.assign({
+        "data-grab": "1",
+        className: "sheet-grab px-4 pb-3 flex items-center gap-3",
+        style: { borderBottom: "1px solid " + COLORS.line }
+      }, dragHandlers),
+        onBack ? h(BackButton, { onClick: onBack, label: "Back one screen" }) : null,
+        h("div", { className: "flex-1 min-w-0" },
+          h("div", { style: { color: COLORS.ink }, className: "font-display text-lg leading-tight truncate" }, props.title),
+          props.subtitle && h("div", { style: { color: COLORS.slate }, className: "text-[11px] font-mono truncate mt-0.5" }, props.subtitle)
+        ),
+        h(CloseButton, { onClick: close, label: "Close " + (props.title || "sheet") })
+      ),
+      h("div", {
+        ref: bodyRef,
+        className: "px-4 py-4 overflow-y-auto",
+        style: { WebkitOverflowScrolling: "touch" }
+      }, props.children)
+    )
+  );
+}
+
+// Centered modal, kept for the PIN gate — a security prompt should not be
+// swipe-dismissable by accident, so it gets ✕ and Esc but no drag.
+function ModalShell(props) {
+  useEscape(props.onClose, true);
+  return h("div", {
+    className: "fixed inset-0 z-50 flex items-center justify-center px-5 fade-in",
+    style: { background: "rgba(8,11,17,0.74)" },
+    role: "dialog", "aria-modal": "true", "aria-label": props.title
+  },
+    h("div", { onClick: props.onClose, className: "absolute inset-0" }),
+    h("div", { style: { background: COLORS.card }, className: "relative w-full max-w-sm rounded-3xl p-5" },
+      h("div", { className: "flex items-start gap-3 mb-3" },
+        props.onBack ? h(BackButton, { onClick: props.onBack }) : null,
+        h("div", { className: "flex-1 min-w-0" },
+          h("div", { style: { color: COLORS.ink }, className: "font-display text-xl leading-tight" }, props.title),
+          props.subtitle && h("div", { style: { color: COLORS.slate }, className: "text-sm mt-1 leading-relaxed" }, props.subtitle)
+        ),
+        h(CloseButton, { onClick: props.onClose, label: "Close " + (props.title || "dialog") })
+      ),
+      props.children
+    )
+  );
+}
+
+// ---------------------------------------------------------------------
+// RULE 13 — just-in-time permissions.
+// Nothing in this block runs at page load. requestNotificationAccess() is
+// only ever reachable from a tap on the reminder control itself, so the
+// browser prompt appears in response to an explicit, understood action.
+// ---------------------------------------------------------------------
+function notificationState() {
+  try {
+    if (typeof Notification === "undefined") return "unsupported";
+    return Notification.permission;
+  } catch (e) { return "unsupported"; }
+}
+
+async function requestNotificationAccess() {
+  var state = notificationState();
+  if (state === "unsupported") return { ok: false, message: "This browser can't show reminders." };
+  if (state === "denied") return { ok: false, message: "Reminders are blocked for this site in your browser settings." };
+  if (state === "granted") return { ok: true };
+  try {
+    var res = await Notification.requestPermission();
+    if (res === "granted") return { ok: true };
+    return { ok: false, message: "No problem \u2014 the dashboard works exactly the same without reminders." };
+  } catch (e) { return { ok: false, message: "Couldn't ask for permission on this browser." }; }
+}
+
+function showLocalNotification(title, body) {
+  try {
+    if (notificationState() === "granted") new Notification(title, { body: body, tag: "bru-reminder" });
+  } catch (e) {}
+}
+
+// ---------------------------------------------------------------------
+// RULE 9 + Jakob's Law — bottom tab bar.
+// Bottom navigation is where every mobile user already expects primary
+// destinations to be. Tapping the tab you are already on scrolls that
+// tab's content straight back to the top.
+// ---------------------------------------------------------------------
+function NavIcon(props) {
+  var n = props.name, c = props.color, sw = 1.7;
+  var common = { width: 21, height: 21, viewBox: "0 0 24 24", fill: "none", stroke: c, strokeWidth: sw, strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true" };
+  if (n === "today") {
+    return h("svg", common,
+      h("rect", { x: "3.5", y: "4.5", width: "17", height: "16", rx: "3" }),
+      h("path", { d: "M8 2.8v3.4M16 2.8v3.4M3.5 9.5h17" }),
+      h("path", { d: "M9 14.4l2 2 4-4" })
+    );
+  }
+  if (n === "team") {
+    return h("svg", common,
+      h("path", { d: "M4 20V11M9.3 20V5M14.7 20v-6.5M20 20V8.5" })
+    );
+  }
+  if (n === "rewards") {
+    return h("svg", common,
+      h("circle", { cx: "12", cy: "9", r: "5.2" }),
+      h("path", { d: "M8.4 13.4L6.8 21l5.2-2.6L17.2 21l-1.6-7.6" })
+    );
+  }
+  if (n === "manager") {
+    return h("svg", common,
+      h("path", { d: "M12 3l7.5 3v6c0 4.6-3.2 7.9-7.5 9.4C7.7 19.9 4.5 16.6 4.5 12V6z" }),
+      h("path", { d: "M9.2 12.2l2 2 3.6-3.8" })
+    );
+  }
+  return h("svg", common,
+    h("circle", { cx: "10", cy: "8.2", r: "3.6" }),
+    h("path", { d: "M3.6 20c0-3.4 2.9-5.6 6.4-5.6 1.3 0 2.5.3 3.5.9" }),
+    h("path", { d: "M17.6 14.4v5.4M20.3 17.1h-5.4" })
+  );
+}
+
+function BottomNav(props) {
+  var tabs = props.tabs, active = props.active, onSelect = props.onSelect;
+  if (!tabs || tabs.length < 2) return null;
+  return h("nav", {
+    "aria-label": "Primary",
+    className: "fixed bottom-0 left-0 right-0 z-40",
+    style: {
+      background: COLORS.card,
+      borderTop: "1px solid " + COLORS.line,
+      paddingBottom: "env(safe-area-inset-bottom)",
+      boxShadow: "0 -8px 24px rgba(0,0,0,0.28)"
+    }
+  },
+    h("div", { className: "max-w-md mx-auto flex" },
+      tabs.map(function (t) {
+        var on = t.key === active;
+        return h("button", {
+          key: t.key,
+          type: "button",
+          onClick: function () { onSelect(t.key); },
+          "aria-current": on ? "page" : undefined,
+          "aria-label": t.label + (on ? " (current tab \u2014 tap again to scroll to top)" : ""),
+          style: { color: on ? COLORS.brass : COLORS.slate },
+          className: "flex-1 pt-2 pb-1.5 flex flex-col items-center gap-0.5 active:scale-95 transition-transform"
+        },
+          h(NavIcon, { name: t.icon, color: on ? COLORS.brass : COLORS.slate }),
+          h("span", { className: "text-[9.5px] font-mono tracking-wide" }, t.label)
+        );
+      })
+    )
+  );
+}
+
+// ---------------------------------------------------------------------
+// Jakob's Law header: brand/home top-left, search top-centre-right,
+// account utility top-right — the arrangement every user already knows.
+// ---------------------------------------------------------------------
+function AppHeader(props) {
+  return h("header", { style: { background: COLORS.card }, className: "px-4 pt-5 pb-4 rounded-b-3xl" },
+    h("div", { className: "flex items-center gap-3" },
+      h("button", {
+        type: "button",
+        onClick: props.onHome,
+        "aria-label": "Battle River Unit \u2014 back to the top of this tab",
+        className: "flex items-center gap-3 min-w-0 flex-1 text-left active:opacity-70"
+      },
+        h(BattleRiverMark, { size: 34, uid: props.uid || "hdr" }),
+        h("div", { className: "min-w-0" },
+          h("div", { style: { color: COLORS.brassLight }, className: "text-[11px] tracking-[0.2em] uppercase font-mono" }, props.eyebrow),
+          h("div", { className: "font-display text-white text-xl mt-0.5 truncate" }, props.title)
+        )
+      ),
+      props.onSearch && h(RoundIcon, {
+        onClick: props.onSearch, label: "Search advisors and candidates", glyph: "\u2315",
+        color: "rgba(255,255,255,0.78)", background: "rgba(255,255,255,0.06)"
+      }),
+      props.onAccount && h("button", {
+        type: "button",
+        onClick: props.onAccount,
+        "aria-label": "Account and settings",
+        style: { background: COLORS.brass, color: COLORS.parchment },
+        className: "w-9 h-9 rounded-full flex items-center justify-center font-display text-sm shrink-0 active:scale-95 transition-transform"
+      }, props.initials || "\u2699")
+    ),
+    props.children
+  );
+}
+
+function initialsOf(name) {
+  var parts = String(name || "").trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return "\u2699";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+}
+
 function App() {
   var loadingState = useState(true); var loading = loadingState[0], setLoading = loadingState[1];
   var dbErrorState = useState(null); var dbError = dbErrorState[0], setDbError = dbErrorState[1];
@@ -361,7 +1038,29 @@ function App() {
   var submissionsState = useState([]); var submissions = submissionsState[0], setSubmissions = submissionsState[1];
   var awardProgressState = useState([]); var awardProgress = awardProgressState[0], setAwardProgress = awardProgressState[1];
   var teamLoadingState = useState(false); var teamLoading = teamLoadingState[0], setTeamLoading = teamLoadingState[1];
-  var viewState = useState("advisor"); var view = viewState[0], setView = viewState[1];
+  // ---- RULE 15: the route IS the state. Every shareable destination is
+  // reconstructable from the URL, so a notification, a pasted link or a
+  // search result lands on the exact entity instead of the home dashboard.
+  var routeState = useState(function () { return parseRoute(); });
+  var route = routeState[0], setRoute = routeState[1];
+  var requestedView = VIEW_KEYS.indexOf(route.view) !== -1 ? route.view : "today";
+
+  // How many history entries this session has pushed. Dismissing an
+  // overlay pops one only if we actually created it; someone who opened a
+  // deep link straight onto a sheet gets a plain state replace instead, so
+  // ✕ never boots them out of the app entirely.
+  var pushDepthRef = useRef(0);
+
+  function navigate(patch, push) {
+    var next = Object.assign({}, route, patch);
+    setRoute(next);
+    var doPush = push !== false;
+    if (doPush) pushDepthRef.current += 1;
+    writeRoute(next, doPush);
+  }
+  // Kept so existing call sites (chooseAdvisor, unlockManager) still read
+  // naturally; "advisor" is normalised to the Today tab.
+  function setView(v) { navigate({ view: v === "advisor" ? "today" : v, advisor: null, sheet: null }, true); }
   var switchingState = useState(false); var switching = switchingState[0], setSwitching = switchingState[1];
   var pulseState = useState(null); var pulse = pulseState[0], setPulse = pulseState[1];
   var showGateState = useState(false); var showManagerGate = showGateState[0], setShowManagerGate = showGateState[1];
@@ -482,20 +1181,53 @@ function App() {
     } catch (e) { setReferrals(previous); }
   };
  
+  // Manager-only destinations fall back to Today (and raise the PIN gate)
+  // rather than rendering an empty screen for someone without access.
+  var managerOnly = requestedView === "manager" || requestedView === "recruitment";
+  var view = (managerOnly && !isManager) ? "today" : requestedView;
+  var isAdvisorTab = view === "today" || view === "team" || view === "rewards";
+
   useEffect(function () {
-    if (view === "advisor" || view === "manager") loadTeamData();
-  }, [view]);
+    if (managerOnly && !isManager && myIdentity) setShowManagerGate(true);
+    // eslint-disable-next-line
+  }, [managerOnly, isManager, !!myIdentity]);
+
+  // Normalise the URL on first paint so Back has somewhere to go, and keep
+  // the in-memory route in step with the browser's own history stack.
+  useEffect(function () {
+    writeRoute({ view: requestedView, advisor: route.advisor, sheet: route.sheet, lane: route.lane, q: route.q }, false);
+    function onPop() {
+      pushDepthRef.current = Math.max(0, pushDepthRef.current - 1);
+      setRoute(parseRoute());
+    }
+    window.addEventListener("popstate", onPop);
+    return function () { window.removeEventListener("popstate", onPop); };
+    // eslint-disable-next-line
+  }, []);
+
+  // One fetch when entering the data-backed area — not once per tab tap.
+  var dataScope = (isAdvisorTab || view === "manager") ? "team" : "none";
+  useEffect(function () {
+    if (dataScope === "team") loadTeamData();
+    // eslint-disable-next-line
+  }, [dataScope]);
+
+  // RULE 8: each destination keeps its own scroll offset. Leaving Team for
+  // Rewards and coming back returns you to the same pixel, not the top.
+  // Declared up here with the other hooks so it can never sit behind one of
+  // the early returns below — hook order has to be identical every render.
+  useScrollMemory("view:" + view, !!myIdentity && !switching && !pendingSelf && !isRecruitment);
  
   // Auto-logged metrics (New Prospects, Chat Script Usage) have no tap
   // button to trigger a targeted re-fetch any more, so this polls while
   // the Advisor tab is open — same "just update in the background"
   // approach the Script Tool already uses for its own sync.
   useEffect(function () {
-    if (view !== "advisor" || !myCode) return;
+    if (!isAdvisorTab || !myCode) return;
     refreshMyEntries(myCode);
     var iv = setInterval(function () { refreshMyEntries(myCode); }, 20000);
     return function () { clearInterval(iv); };
-  }, [view, myCode]);
+  }, [isAdvisorTab, myCode]);
  
   useEffect(function () {
     if (isRecruitment || (view === "recruitment" && isManager)) loadRecruitmentData();
@@ -628,15 +1360,25 @@ function App() {
     var ser = (serial || "").trim();
     if (!ser) return { ok: false, message: "Enter the APP serial number." };
     if (!(amt > 0)) return { ok: false, message: "Enter the FYP amount in pesos." };
+    // RULE 11: show it in the advisor's own list immediately. Nothing
+    // about settlement is faked — the optimistic row is explicitly
+    // unsettled, which is exactly what the real row will be.
+    var previousSubs = submissions;
+    setSubmissions([{
+      id: "pending-" + Date.now(), advisor_code: advisorCode, submitted_date: today,
+      amount: amt, app_serial: ser, client_name: (clientName || "").trim() || null,
+      settled: false, _pending: true
+    }].concat(previousSubs));
     var res = await sb.from("submissions").insert({
       advisor_code: advisorCode, submitted_date: today, amount: amt,
       app_serial: ser, client_name: (clientName || "").trim() || null
     });
     if (res.error) {
+      setSubmissions(previousSubs);
       var dup = res.error.code === "23505" || (res.error.message || "").indexOf("duplicate") !== -1;
       return { ok: false, message: dup ? "That APP serial is already logged." : "Couldn't save. Try again." };
     }
-    await loadTeamData();
+    loadTeamData();
     logEvent("submission_added", advisorCode, { amount: amt });
     return { ok: true };
   };
@@ -698,12 +1440,25 @@ function App() {
     } catch (e) { setSubmissions(previous); }
   };
  
+  // RULE 11: the candidate is in the list on the same frame as the tap.
+  // The insert and the authoritative refetch run behind it; a failure
+  // rolls the row back out and surfaces a message, it never silently lies.
   var addReferral = async function (candidateName, recipientCode) {
     var name = (candidateName || "").trim();
     if (!name) return { ok: false, message: "Enter the candidate's name." };
+    var previous = referrals;
+    var optimisticRow = {
+      id: "pending-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7),
+      candidate_name: name, recipient_code: recipientCode, stage: "Attended Forum",
+      created_at: new Date().toISOString(), _pending: true
+    };
+    setReferrals(previous.concat([optimisticRow]));
     var res = await sb.from("referrals").insert({ candidate_name: name, recipient_code: recipientCode, stage: "Attended Forum" });
-    if (res.error) return { ok: false, message: "Couldn't save. Try again." };
-    await loadTeamData();
+    if (res.error) {
+      setReferrals(previous);
+      return { ok: false, message: "Couldn't save. Try again." };
+    }
+    loadTeamData();
     logEvent("referral_added", recipientCode);
     return { ok: true };
   };
@@ -930,27 +1685,54 @@ function App() {
       )
     );
   }
+  // RULE 7: the first paint is already the shape of the real dashboard —
+  // header, cards, list — never an empty container or a bare spinner on
+  // white. The layout doesn't jump when the data lands.
   if (loading) {
-    return h("div", { style: { background: COLORS.parchment, minHeight: "100vh" }, className: "flex flex-col items-center justify-center gap-4" },
-      h(BattleRiverMark, { size: 62, uid: "load" }),
-      h("div", { style: { color: COLORS.slate }, className: "text-[11px] tracking-widest uppercase font-mono" }, "Loading\u2026")
+    return h("div", { style: { background: COLORS.parchment, minHeight: "100vh" } },
+      h("div", { className: "max-w-md mx-auto" },
+        h("div", { style: { background: COLORS.card }, className: "px-4 pt-5 pb-5 rounded-b-3xl" },
+          h("div", { className: "flex items-center gap-3" },
+            h(BattleRiverMark, { size: 34, uid: "load" }),
+            h("div", { className: "flex-1 space-y-2" },
+              h(Skeleton, { h: "9px", w: "46%" }),
+              h(Skeleton, { h: "18px", w: "64%" })
+            ),
+            h(Skeleton, { h: "36px", w: "36px", r: "50%" })
+          )
+        ),
+        h("div", { className: "px-5 mt-5 space-y-4" },
+          h(ProgressBar, { active: true, label: "Loading the dashboard" }),
+          h(SkeletonCard, { lines: 3 }),
+          h(SkeletonCard, { lines: 4 }),
+          h(SkeletonList, { rows: 4 })
+        ),
+        h("div", {
+          style: { color: COLORS.slate },
+          className: "text-[11px] tracking-widest uppercase font-mono text-center mt-6",
+          role: "status", "aria-live": "polite"
+        }, "Loading\u2026")
+      )
     );
   }
  
+  // Recruitment (ACES) runs as its own single-purpose surface — one job,
+  // one screen, so it gets a back control instead of a tab bar.
   if (isRecruitment) {
-    var recHeader = h("div", { style: { background: COLORS.card }, className: "px-5 pt-6 pb-5 rounded-b-3xl" },
-      h("div", { className: "flex items-center justify-between" },
-        h("div", { className: "flex items-center gap-3" },
+    var leaveRecruitment = function () {
+      setIsRecruitment(false); lset("is-recruitment", false); setSwitching(true);
+    };
+    var recHeader = h("header", { style: { background: COLORS.card }, className: "px-4 pt-5 pb-4 rounded-b-3xl" },
+      h("div", { className: "flex items-center gap-3" },
+        h(BackButton, { onClick: leaveRecruitment, label: "Back to sign-in" }),
+        h("div", { className: "flex items-center gap-3 min-w-0 flex-1" },
           h(BattleRiverMark, { size: 34, uid: "aces" }),
-          h("div", null,
-            h("div", { style: { color: COLORS.brassLight }, className: "text-[11px] tracking-[0.2em] uppercase font-mono" }, "Battle River \u00b7 v3.1"),
-            h("div", { className: "font-display text-white text-2xl mt-0.5" }, "Recruitment")
+          h("div", { className: "min-w-0" },
+            h("div", { style: { color: COLORS.brassLight }, className: "text-[11px] tracking-[0.2em] uppercase font-mono" }, "Battle River \u00b7 v4.0"),
+            h("div", { className: "font-display text-white text-xl mt-0.5" }, "Recruitment")
           )
         ),
-        h("button", {
-          onClick: function () { setIsRecruitment(false); lset("is-recruitment", false); setSwitching(true); },
-          className: "text-white/70 hover:text-white text-xs font-mono"
-        }, "switch")
+        h(CloseButton, { onClick: leaveRecruitment, label: "Leave recruitment mode" })
       )
     );
     return h("div", { style: { background: COLORS.parchment, minHeight: "100vh" } },
@@ -964,41 +1746,63 @@ function App() {
       )
     );
   }
- 
+
   var showOnboarding = !myIdentity || switching;
- 
+
+  // RULE 9: tapping the tab you are already on takes you to the top of it.
+  function onTabPress(key) {
+    if (key === view) { scrollToTop(true); return; }
+    if ((key === "manager" || key === "recruitment") && !isManager) { setShowManagerGate(true); return; }
+    navigate({ view: key, advisor: null, sheet: null }, true);
+  }
+
+  var navTabs = [
+    { key: "today", label: "Today", icon: "today" },
+    { key: "team", label: "Team", icon: "team" },
+    { key: "rewards", label: "Rewards", icon: "rewards" }
+  ];
+  if (isManager) {
+    navTabs.push({ key: "manager", label: "Manager", icon: "manager" });
+    navTabs.push({ key: "recruitment", label: "Recruit", icon: "recruit" });
+  }
+
+  var openSheet = route.sheet;
+  var closeSheet = function () {
+    // RULE 6: ✕, Esc, a downward swipe and the hardware Back button all
+    // resolve to "go back exactly one screen". When we pushed the entry,
+    // that is literally history.back(); otherwise it is an equivalent
+    // in-place state replace.
+    if (pushDepthRef.current > 0) window.history.back();
+    else navigate({ sheet: null, advisor: null }, false);
+  };
+
   var mainBody = null;
   if (!showOnboarding) {
-    var visibleTabs = isManager ? ["advisor", "manager", "recruitment"] : ["advisor"];
-    var tabLabel = function (v) { return v === "advisor" ? "Advisor view" : v === "manager" ? "Manager view" : "Recruitment"; };
-    var tabsRow = visibleTabs.length > 1 ? h("div", { className: "flex mt-5 rounded-xl overflow-hidden border border-white/15" },
-      visibleTabs.map(function (v) {
-        return h("button", {
-          key: v,
-          onClick: function () { setView(v); },
-          className: "flex-1 py-2.5 text-sm font-medium",
-          style: { background: view === v ? COLORS.brass : "transparent", color: view === v ? COLORS.parchment : "rgba(255,255,255,0.75)" }
-        }, tabLabel(v));
-      })
-    ) : null;
- 
-    var header = h("div", { style: { background: COLORS.card }, className: "px-5 pt-6 pb-5 rounded-b-3xl" },
-      h("div", { className: "flex items-center justify-between" },
-        h("div", { className: "flex items-center gap-3" },
-          h(BattleRiverMark, { size: 34, uid: "hdr" }),
-          h("div", null,
-            h("div", { style: { color: COLORS.brassLight }, className: "text-[11px] tracking-[0.2em] uppercase font-mono" }, "Battle River \u00b7 v3.1"),
-            h("div", { className: "font-display text-white text-2xl mt-0.5" }, myIdentity.name)
-          )
-        ),
-        h("button", { onClick: function () { setSwitching(true); }, className: "text-white/70 hover:text-white text-xs font-mono" }, "switch")
-      ),
-      tabsRow
+    var viewTitle = view === "manager" ? "Manager view"
+      : view === "recruitment" ? "Recruitment"
+      : myIdentity.name;
+    var viewEyebrow = view === "manager" ? "Battle River \u00b7 Team"
+      : view === "recruitment" ? "Battle River \u00b7 ACES"
+      : "Battle River \u00b7 v4.0";
+
+    var header = h(AppHeader, {
+      uid: "hdr",
+      eyebrow: viewEyebrow,
+      title: viewTitle,
+      initials: initialsOf(myIdentity.name),
+      onHome: function () { scrollToTop(true); },
+      onSearch: isManager ? function () { navigate({ sheet: "search" }, true); } : null,
+      onAccount: function () { navigate({ sheet: "account" }, true); }
+    },
+      // RULE 7: a refresh that will replace what's on screen announces
+      // itself with a live progress bar rather than a frozen page.
+      h("div", { className: "mt-3" }, h(ProgressBar, { active: !!teamLoading, label: "Refreshing team data" }))
     );
- 
-    mainBody = h("div", { className: "max-w-md mx-auto pb-10" },
+
+    mainBody = h("div", { className: "max-w-md mx-auto has-bottom-nav" },
       header,
-      view === "advisor" && h(AdvisorView, {
+      isAdvisorTab && h(AdvisorView, {
+        section: view,
         date: today, entry: myTodayEntry, pulse: pulse, targets: targets, saveError: saveError,
         onBump: bump, onToggleSocial: function () { upsertField({ social: !myTodayEntry.social }); }, onNote: function (note) { upsertField({ note: note }); },
         mySubmissions: mySubmissions,
@@ -1011,7 +1815,8 @@ function App() {
         myWeekDayLabels: myWeekDayLabels, monthBoards: monthBoards, myReferrals: myReferrals,
         currentStreak: currentStreak, bestStreak: bestStreak, onAddReferral: function (name) { return addReferral(name, myCode); },
         lastSyncedAt: lastSyncedAt,
-        awardProgress: awardProgress
+        awardProgress: awardProgress,
+        hasTeamData: teamEntries.length > 0
       }),
       view === "manager" && isManager && h(ManagerView, {
         date: today, roster: roster, activeRoster: activeRoster, teamEntries: teamEntries, loading: teamLoading, onRefresh: loadTeamData,
@@ -1025,6 +1830,7 @@ function App() {
         onApproveAdvisor: approveAdvisor, onRejectAdvisor: rejectAdvisor,
         myCode: myCode,
         awardProgress: awardProgress,
+        route: route, navigate: navigate, closeSheet: closeSheet,
         onAddManagerSubmission: function(advisorCode, serial, clientName, amount, nbAc, submittedDate, settledDate) {
           return addManagerSubmission(advisorCode, serial, clientName, amount, nbAc, submittedDate, settledDate);
         }
@@ -1032,10 +1838,14 @@ function App() {
       view === "recruitment" && isManager && h(RecruitmentView, {
         readOnly: true, today: today, scorecard: recruitment.scorecard, forumEvents: recruitment.forumEvents,
         loading: recruitment.loading, onRefresh: loadRecruitmentData
-      })
+      }),
+      h("div", { style: { color: COLORS.slate }, className: "text-center text-[10px] font-mono mt-8 px-5 leading-relaxed" },
+        "Battle River Unit \u00b7 Activity Dashboard v4.0",
+        h("br", null),
+        "Built by Matthew Isaiah Masindo")
     );
   }
- 
+
   return h("div", { style: { background: COLORS.parchment, minHeight: "100vh" } },
     pendingSelf
       ? h(WaitingApprovalScreen, {
@@ -1052,22 +1862,221 @@ function App() {
               onEnterRecruitment: function () { setIsRecruitment(true); lset("is-recruitment", true); setSwitching(false); }
             })
           : mainBody),
+
+    !showOnboarding && !pendingSelf && h(BottomNav, { tabs: navTabs, active: view, onSelect: onTabPress }),
+
+    !showOnboarding && !pendingSelf && openSheet === "account" && h(AccountSheet, {
+      advisor: myIdentity, isManager: isManager, isRecruitment: isRecruitment,
+      onClose: closeSheet,
+      onSwitch: function () { navigate({ sheet: null }, false); setSwitching(true); },
+      onManagerTools: function () { navigate({ sheet: null }, false); setShowManagerGate(true); },
+      onExport: isManager ? function () { navigate({ view: "manager", sheet: "export" }, true); } : null,
+      lastSyncedAt: lastSyncedAt
+    }),
+
+    !showOnboarding && !pendingSelf && openSheet === "search" && h(SearchSheet, {
+      roster: roster, referrals: referrals, initialQuery: route.q || "",
+      onClose: closeSheet,
+      onPickAdvisor: function (code) { navigate({ view: "manager", advisor: code, sheet: null, q: null }, true); },
+      onPickCandidate: function (name) { navigate({ view: "manager", sheet: null, q: name }, true); }
+    }),
+
     showManagerGate && h(ManagerGate, { hasPin: hasManagerPin, onSubmit: unlockManager, onClose: cancelManagerGate })
   );
 }
  
+// ---------------------------------------------------------------------
+// Account / settings — the top-right utility destination, where every
+// mobile user already looks for "who am I signed in as" (Jakob's Law).
+// It is a bottom sheet, so a downward swipe dismisses it (rule 14).
+// ---------------------------------------------------------------------
+function AccountSheet(props) {
+  var advisor = props.advisor || {}, isManager = props.isManager;
+  var permState = useState(function () { return notificationState(); });
+  var perm = permState[0], setPerm = permState[1];
+  var busyState = useState(false); var busy = busyState[0], setBusy = busyState[1];
+  var msgState = useState(""); var msg = msgState[0], setMsg = msgState[1];
+  var okState = useState(true); var ok = okState[0], setOk = okState[1];
+
+  // RULE 13: this is the ONLY path to the browser permission prompt, and
+  // it is behind an explicit tap on the feature that needs it. Nothing is
+  // requested on load, on sign-in, or on first render of this sheet.
+  var enableReminders = async function () {
+    setBusy(true); setMsg("");
+    var res = await requestNotificationAccess();
+    setBusy(false);
+    setPerm(notificationState());
+    setOk(!!res.ok);
+    if (res.ok) {
+      lset("br-reminders-on", true);
+      setMsg("Reminders are on for this device.");
+      showLocalNotification("Battle River Unit", "Daily logging reminders are on.");
+    } else {
+      setMsg(res.message || "Reminders weren't enabled.");
+    }
+  };
+
+  var row = function (key, label, detail, onClick, tone) {
+    return h("button", {
+      key: key, type: "button", onClick: onClick,
+      style: { background: COLORS.parchment, borderColor: COLORS.line },
+      className: "w-full text-left px-4 py-3.5 rounded-2xl border flex items-center justify-between gap-3 active:scale-[0.99] transition-transform"
+    },
+      h("div", { className: "min-w-0" },
+        h("div", { style: { color: tone || COLORS.ink }, className: "text-sm font-medium" }, label),
+        detail && h("div", { style: { color: COLORS.slate }, className: "text-[11px] mt-0.5 leading-relaxed" }, detail)
+      ),
+      h("span", { style: { color: COLORS.slate }, className: "shrink-0" }, "\u203a")
+    );
+  };
+
+  return h(BottomSheet, {
+    title: advisor.name || "Account",
+    subtitle: (advisor.code ? "Code " + advisor.code : "") + (isManager ? " \u00b7 Manager access" : " \u00b7 Advisor"),
+    onClose: props.onClose
+  },
+    h("div", { className: "space-y-2.5" },
+      row("switch", "Switch advisor or role", "Sign in as someone else on this device", props.onSwitch),
+      !isManager && row("mgr", "Unlock manager tools", "Needs the manager PIN", props.onManagerTools),
+      props.onExport && row("export", "Export last 60 days as CSV", "Opens the export sheet in Manager view", props.onExport),
+
+      h("div", {
+        style: { background: COLORS.parchment, borderColor: COLORS.line },
+        className: "rounded-2xl border px-4 py-3.5"
+      },
+        h("div", { style: { color: COLORS.ink }, className: "text-sm font-medium" }, "Daily logging reminder"),
+        h("div", { style: { color: COLORS.slate }, className: "text-[11px] mt-0.5 leading-relaxed mb-2.5" },
+          perm === "granted"
+            ? "Your browser already allows reminders for this dashboard."
+            : perm === "denied"
+              ? "Your browser is blocking reminders for this site. You'd need to re-allow them in site settings."
+              : "We only ask your browser for permission when you tap this \u2014 never on page load."),
+        perm !== "granted" && h(BusyButton, {
+          busy: busy, busyLabel: "Asking\u2026", label: "Turn on reminders",
+          onClick: enableReminders, disabled: perm === "denied" || perm === "unsupported",
+          className: "w-full py-2.5 rounded-xl text-white text-sm font-semibold active:scale-[0.98] transition-transform"
+        }),
+        msg && h("div", { style: { color: ok ? COLORS.good : COLORS.rust }, className: "text-[11px] mt-2" }, msg)
+      ),
+
+      h("div", { style: { color: COLORS.slate }, className: "text-[10px] font-mono text-center leading-relaxed pt-2" },
+        "Last synced " + (fmtSyncAgo(props.lastSyncedAt) || "\u2014"),
+        h("br", null),
+        "Activity Dashboard v4.0 \u00b7 Built by Matthew Isaiah Masindo")
+    )
+  );
+}
+
+// ---------------------------------------------------------------------
+// Search — reached from the top of the screen, where every user expects
+// it. Results deep-link straight to the entity (rule 15) rather than
+// dropping the manager back on the dashboard to hunt for it.
+// ---------------------------------------------------------------------
+function SearchSheet(props) {
+  var roster = props.roster || [], referrals = props.referrals || [];
+  var qState = useState(props.initialQuery || ""); var q = qState[0], setQ = qState[1];
+  var term = q.trim().toLowerCase();
+
+  var advisors = !term ? [] : roster.filter(function (r) {
+    return String(r.name || "").toLowerCase().indexOf(term) !== -1 || String(r.code || "").indexOf(term) !== -1;
+  }).slice(0, 8);
+
+  var candidates = !term ? [] : referrals.filter(function (r) {
+    return String(r.candidate_name || "").toLowerCase().indexOf(term) !== -1;
+  }).slice(0, 8);
+
+  return h(BottomSheet, { title: "Search", subtitle: "Advisors and referral candidates", onClose: props.onClose },
+    h("input", {
+      value: q, autoFocus: true,
+      onChange: function (ev) { setQ(ev.target.value); },
+      placeholder: "Name or advisor code\u2026",
+      "aria-label": "Search advisors and candidates",
+      style: { borderColor: COLORS.line, background: COLORS.parchment, color: COLORS.ink },
+      className: "w-full px-4 py-3 rounded-2xl border outline-none focus:ring-2 text-sm mb-3"
+    }),
+    !term && h("div", { style: { color: COLORS.slate }, className: "text-[12px] text-center py-6 leading-relaxed" },
+      "Start typing a name or code. Picking a result opens that advisor directly."),
+    term && advisors.length === 0 && candidates.length === 0 && h("div", {
+      style: { color: COLORS.slate }, className: "text-[12px] text-center py-6"
+    }, "No advisor or candidate matches \u201c" + q.trim() + "\u201d."),
+    advisors.length > 0 && h("div", { className: "mb-3" },
+      h("div", { style: { color: COLORS.slate }, className: "text-[10px] font-mono uppercase tracking-widest mb-1.5" }, "Advisors"),
+      h("div", { className: "space-y-1.5" },
+        advisors.map(function (r) {
+          return h("button", {
+            key: r.code || r.id, type: "button",
+            onClick: function () { props.onPickAdvisor(r.code); },
+            style: { background: COLORS.parchment, borderColor: COLORS.line },
+            className: "w-full text-left px-3.5 py-3 rounded-xl border flex items-center justify-between gap-2 active:scale-[0.99] transition-transform"
+          },
+            h("div", { className: "min-w-0" },
+              h("div", { style: { color: COLORS.ink }, className: "text-sm font-medium truncate" }, r.name),
+              h("div", { style: { color: COLORS.slate }, className: "text-[10px] font-mono" },
+                (r.code || "no code") + (r.active === false ? " \u00b7 removed" : ""))
+            ),
+            h("span", { style: { color: COLORS.slate } }, "\u203a")
+          );
+        })
+      )
+    ),
+    candidates.length > 0 && h("div", null,
+      h("div", { style: { color: COLORS.slate }, className: "text-[10px] font-mono uppercase tracking-widest mb-1.5" }, "Referral candidates"),
+      h("div", { className: "space-y-1.5" },
+        candidates.map(function (r) {
+          return h("button", {
+            key: r.id, type: "button",
+            onClick: function () { props.onPickCandidate(r.candidate_name); },
+            style: { background: COLORS.parchment, borderColor: COLORS.line },
+            className: "w-full text-left px-3.5 py-3 rounded-xl border flex items-center justify-between gap-2 active:scale-[0.99] transition-transform"
+          },
+            h("div", { className: "min-w-0" },
+              h("div", { style: { color: COLORS.ink }, className: "text-sm font-medium truncate" }, r.candidate_name),
+              h("div", { style: { color: COLORS.slate }, className: "text-[10px]" }, referralStatus(r))
+            ),
+            h("span", { style: { color: COLORS.brass }, className: "font-mono text-xs" }, fmtPhp(referralPayout(r)))
+          );
+        })
+      )
+    )
+  );
+}
+
 function Onboarding(props) {
   var roster = props.roster, onChoose = props.onChoose, onCreate = props.onCreate, onVerifyPin = props.onVerifyPin,
     cancelable = props.cancelable, onCancel = props.onCancel, onEnterRecruitment = props.onEnterRecruitment;
-  var modeState = useState("role"); var mode = modeState[0], setMode = modeState[1];
+  // RULE 6: the wizard keeps a real stack, so ← pops exactly one screen
+  // no matter how the user got here, and ✕ leaves the flow entirely.
+  var stackState = useState(["role"]); var stack = stackState[0], setStack = stackState[1];
+  var mode = stack[stack.length - 1];
+  function pushMode(m) { setError(""); setStack(stack.concat([m])); }
+  function popMode() {
+    setError("");
+    if (stack.length > 1) setStack(stack.slice(0, -1));
+    else if (cancelable) onCancel();
+  }
+
   var roleState = useState("advisor"); var role = roleState[0], setRole = roleState[1];
   var targetState = useState(null); var target = targetState[0], setTarget = targetState[1];
   var pinState = useState(""); var pin = pinState[0], setPin = pinState[1];
   var pinBusyState = useState(false); var pinBusy = pinBusyState[0], setPinBusy = pinBusyState[1];
   var errorState = useState(""); var error = errorState[0], setError = errorState[1];
-  var newNameState = useState(""); var newName = newNameState[0], setNewName = newNameState[1];
-  var newCodeState = useState(""); var newCode = newCodeState[0], setNewCode = newCodeState[1];
+  // RULE 12: name and code survive an accidental back-swipe or reload.
+  // The PIN deliberately does not — a secret must never sit in storage.
+  var newNameDraft = useDraft("signup-name", ""); var newName = newNameDraft[0], setNewName = newNameDraft[1], clearNameDraft = newNameDraft[2];
+  var newCodeDraft = useDraft("signup-code", ""); var newCode = newCodeDraft[0], setNewCode = newCodeDraft[1], clearCodeDraft = newCodeDraft[2];
   var newBusyState = useState(false); var newBusy = newBusyState[0], setNewBusy = newBusyState[1];
+
+  // Shared wizard chrome: ← one step back on the left, ✕ out of the flow
+  // on the right, in the positions every app puts them.
+  function wizardChrome(label) {
+    var spacer = h("div", { style: { width: "36px" }, "aria-hidden": "true" });
+    return h("div", { className: "flex items-center gap-3 mb-6" },
+      (stack.length > 1 || cancelable) ? h(BackButton, { onClick: popMode, label: "Back one step" }) : spacer,
+      h("div", { className: "flex-1 min-w-0 text-center" },
+        h("div", { style: { color: COLORS.slate }, className: "text-[10px] font-mono uppercase tracking-[0.22em] truncate" }, label)),
+      cancelable ? h(CloseButton, { onClick: onCancel, label: "Close sign-in" }) : spacer
+    );
+  }
  
   // Shared PIN gate — calls the same verify_advisor_pin() RPC the Script
   // Tool uses. Whoever types the PIN first sets it; after that it's a real
@@ -1091,13 +2100,15 @@ function Onboarding(props) {
     setError(""); setNewBusy(true);
     var res = await onCreate({ name: name, code: code });
     setNewBusy(false);
-    if (!res.ok) setError(res.message);
+    if (!res.ok) { setError(res.message); return; }
+    clearNameDraft(); clearCodeDraft();
     // On success, the parent (App) switches this device into the "waiting
     // for approval" screen — nothing further to do here.
   };
  
   if (mode === "role") {
     return h("div", { className: "max-w-md mx-auto min-h-screen flex flex-col justify-center px-6 py-10" },
+      wizardChrome("Step 1 of 3 \u00b7 Role"),
       h("div", { className: "text-center mb-8" },
         h("div", { className: "flex justify-center mb-4" }, h(BattleRiverMark, { size: 74, uid: "role" })),
         h("div", { style: { color: COLORS.ink }, className: "font-display text-2xl" }, "Battle River Unit"),
@@ -1105,7 +2116,7 @@ function Onboarding(props) {
       ),
       h("div", { className: "space-y-3" },
         h("button", {
-          onClick: function () { setRole("advisor"); setError(""); setMode("pick"); },
+          onClick: function () { setRole("advisor"); pushMode("pick"); },
           style: { background: COLORS.card, borderColor: COLORS.line },
           className: "w-full px-4 py-4 rounded-2xl border text-left"
         },
@@ -1113,7 +2124,7 @@ function Onboarding(props) {
           h("div", { style: { color: COLORS.slate }, className: "text-[11px] mt-0.5" }, "Log your day and track your incentives")
         ),
         h("button", {
-          onClick: function () { setRole("manager"); setError(""); setMode("pick"); },
+          onClick: function () { setRole("manager"); pushMode("pick"); },
           style: { background: COLORS.card, borderColor: COLORS.line },
           className: "w-full px-4 py-4 rounded-2xl border text-left"
         },
@@ -1129,12 +2140,13 @@ function Onboarding(props) {
           h("div", { style: { color: COLORS.slate }, className: "text-[11px] mt-0.5" }, "Log leads, forum turnout, and interviews booked")
         )
       ),
-      cancelable && h("button", { onClick: onCancel, style: { color: COLORS.slate }, className: "mt-6 text-sm text-center underline" }, "Cancel")
+      null
     );
   }
  
   if (mode === "pin" && target) {
     return h("div", { className: "max-w-md mx-auto min-h-screen flex flex-col justify-center px-6 py-10" },
+      wizardChrome("Step 3 of 3 \u00b7 PIN"),
       h("div", { className: "text-center mb-8" },
         h("div", { style: { color: COLORS.ink }, className: "font-display text-2xl" }, target.name),
         h("div", { style: { color: COLORS.slate }, className: "text-sm mt-1 leading-relaxed" },
@@ -1148,12 +2160,14 @@ function Onboarding(props) {
         className: "w-full px-4 py-3 rounded-2xl border outline-none focus:ring-2 text-center text-xl font-mono", placeholder: "4\u20136 digit PIN"
       }),
       error && h("div", { style: { color: COLORS.rust }, className: "text-xs text-center mt-2" }, error),
-      h("button", { onClick: submitPin, disabled: pinBusy, style: { background: COLORS.emphasis, opacity: pinBusy ? 0.7 : 1 }, className: "w-full py-3 rounded-2xl text-white font-medium mt-4" }, pinBusy ? "Checking\u2026" : "Continue"),
-      h("button", { onClick: function () { setMode("pick"); setPin(""); setError(""); }, style: { color: COLORS.slate }, className: "mt-4 text-sm text-center underline" }, "Back")
+      h("div", { className: "mt-4" },
+        h(BusyButton, { busy: pinBusy, busyLabel: "Checking\u2026", label: "Continue", onClick: submitPin })),
+      h("button", { onClick: function () { setPin(""); popMode(); }, style: { color: COLORS.slate }, className: "mt-4 text-sm text-center underline" }, "\u2190 Back")
     );
   }
   if (mode === "new") {
     return h("div", { className: "max-w-md mx-auto min-h-screen flex flex-col justify-center px-6 py-10" },
+      wizardChrome("New advisor \u00b7 Request access"),
       h("div", { className: "text-center mb-8" },
         h("div", { style: { color: COLORS.brass }, className: "text-[11px] tracking-[0.25em] uppercase font-mono mb-2" }, "New Advisor"),
         h("div", { style: { color: COLORS.ink }, className: "font-display text-3xl" }, "Request access")
@@ -1166,30 +2180,36 @@ function Onboarding(props) {
         error && h("div", { style: { color: COLORS.rust }, className: "text-xs" }, error),
         h("div", { style: { color: COLORS.slate }, className: "text-[11px] leading-relaxed pt-1" },
           "Your code is just your ID from here \u2014 you'll set a real PIN once a manager approves you. This doesn't sign you in yet."),
-        h("button", { onClick: submitNew, disabled: newBusy, style: { background: COLORS.emphasis, opacity: newBusy ? 0.7 : 1 }, className: "w-full py-3 rounded-2xl text-white font-medium mt-2" }, newBusy ? "Submitting\u2026" : "Request access")
+        h("div", { className: "mt-2" },
+          h(BusyButton, { busy: newBusy, busyLabel: "Submitting\u2026", label: "Request access", onClick: submitNew })),
+        (newName || newCode) && h("div", { style: { color: COLORS.slate }, className: "text-[10px] font-mono text-center pt-1" }, "Draft saved on this device")
       ),
-      h("button", { onClick: function () { setError(""); setMode("pick"); }, style: { color: COLORS.slate }, className: "mt-6 text-sm text-center underline" }, "Back")
+      h("button", { onClick: popMode, style: { color: COLORS.slate }, className: "mt-6 text-sm text-center underline" }, "\u2190 Back")
     );
   }
   return h("div", { className: "max-w-md mx-auto min-h-screen flex flex-col justify-center px-6 py-10" },
+    wizardChrome("Step 2 of 3 \u00b7 Who's logging in"),
     h("div", { className: "text-center mb-8" },
       h("div", { className: "flex justify-center mb-4" }, h(BattleRiverMark, { size: 56, uid: "login" })),
       h("div", { style: { color: COLORS.brass }, className: "text-[10px] tracking-[0.22em] uppercase font-mono" }, role === "manager" ? "Manager sign-in" : "Advisor sign-in"),
       h("div", { style: { color: COLORS.ink }, className: "font-display text-2xl mt-1.5" }, "Who's logging in?")
     ),
+    roster.length === 0 && h("div", {
+      style: { background: COLORS.card, borderColor: COLORS.line, color: COLORS.slate },
+      className: "rounded-2xl border p-5 text-sm text-center mb-4 leading-relaxed"
+    }, "No advisors on the roster yet. Use \u201cI'm new here\u201d below to request access."),
     roster.length > 0 && h("div", { className: "space-y-2 mb-6" },
       roster.map(function (r) {
         return h("button", {
           key: r.code,
-          onClick: function () { setTarget(r); setPin(""); setError(""); setMode("pin"); },
+          onClick: function () { setTarget(r); setPin(""); pushMode("pin"); },
           style: { background: COLORS.card, borderColor: COLORS.line },
           className: "w-full text-left px-4 py-3.5 rounded-2xl border flex items-center justify-between"
         }, h("div", { style: { color: COLORS.ink }, className: "font-medium" }, r.name));
       })
     ),
-    h("button", { onClick: function () { setError(""); setMode("new"); }, style: { borderColor: COLORS.line, color: COLORS.ink }, className: "w-full py-3.5 rounded-2xl border border-dashed font-medium text-sm" }, "+ I'm new here"),
-    h("button", { onClick: function () { setError(""); setMode("role"); }, style: { color: COLORS.slate }, className: "mt-5 text-sm text-center underline" }, "Back"),
-    cancelable && h("button", { onClick: onCancel, style: { color: COLORS.slate }, className: "mt-3 text-sm text-center underline" }, "Cancel")
+    h("button", { onClick: function () { pushMode("new"); }, style: { borderColor: COLORS.line, color: COLORS.ink }, className: "w-full py-3.5 rounded-2xl border border-dashed font-medium text-sm" }, "+ I'm new here"),
+    h("button", { onClick: popMode, style: { color: COLORS.slate }, className: "mt-5 text-sm text-center underline" }, "\u2190 Back")
   );
 }
  
@@ -1278,11 +2298,18 @@ function ManagerGate(props) {
       if (!ok) { setError("Incorrect PIN."); setPin(""); }
     }
   };
-  return h("div", { className: "fixed inset-0 flex items-center justify-center px-6", style: { background: "rgba(8,11,17,0.72)" } },
-    h("div", { style: { background: COLORS.card }, className: "w-full max-w-sm rounded-3xl p-6 relative" },
-      h("button", { onClick: onClose, className: "absolute top-4 right-4", style: { color: COLORS.slate } }, "✕"),
-      h("div", { style: { color: COLORS.ink }, className: "font-display text-xl mb-1" }, hasPin ? "Manager access" : "Set up manager access"),
-      h("div", { style: { color: COLORS.slate }, className: "text-sm mb-4" }, hasPin ? "Enter the manager PIN." : "Set this once — anyone with it can see every advisor's history."),
+  var busyState = useState(false); var busy = busyState[0], setBusy = busyState[1];
+  var guarded = async function () {
+    if (busy) return;
+    setBusy(true);
+    try { await submit(); } finally { setBusy(false); }
+  };
+  return h(ModalShell, {
+    title: hasPin ? "Manager access" : "Set up manager access",
+    subtitle: hasPin ? "Enter the manager PIN." : "Set this once — anyone with it can see every advisor's history.",
+    onClose: onClose
+  },
+    h("div", null,
       h("input", {
         value: pin, onChange: function (ev) { setPin(ev.target.value.replace(/\D/g, "").slice(0, 4)); }, inputMode: "numeric", autoFocus: true, placeholder: "••••",
         style: { borderColor: COLORS.line, background: COLORS.parchment, color: COLORS.ink, letterSpacing: "0.5em" },
@@ -1294,7 +2321,11 @@ function ManagerGate(props) {
         className: "w-full px-4 py-3 rounded-2xl border outline-none focus:ring-2 text-center text-xl font-mono mb-2"
       }),
       error && h("div", { style: { color: COLORS.rust }, className: "text-xs mb-2" }, error),
-      h("button", { onClick: submit, style: { background: COLORS.emphasis }, className: "w-full py-3 rounded-2xl text-white font-medium mt-2" }, hasPin ? "Unlock" : "Set PIN & continue")
+      h("div", { className: "mt-2" },
+        h(BusyButton, {
+          busy: busy, busyLabel: hasPin ? "Checking\u2026" : "Saving\u2026",
+          label: hasPin ? "Unlock" : "Set PIN & continue", onClick: guarded
+        }))
     )
   );
 }
@@ -1371,9 +2402,13 @@ function AdvisorView(props) {
     awardProgress = props.awardProgress || [],
     myWeekDayLabels = props.myWeekDayLabels || [], monthBoards = props.monthBoards || { pipeline: [], grind: [], grosser: [] },
     myReferrals = props.myReferrals || [], currentStreak = props.currentStreak || 0, bestStreak = props.bestStreak || 0,
-    onAddReferral = props.onAddReferral, lastSyncedAt = props.lastSyncedAt;
+    onAddReferral = props.onAddReferral, lastSyncedAt = props.lastSyncedAt,
+    section = props.section || "today", hasTeamData = !!props.hasTeamData;
  
-  var newRefState = useState(""); var newRefName = newRefState[0], setNewRefName = newRefState[1];
+  // RULE 12: a half-typed candidate name survives a tab switch, a back
+  // gesture, or an accidental reload. Cleared only on a successful save.
+  var newRefDraft = useDraft("referral-name-" + (myCode || "anon"), "");
+  var newRefName = newRefDraft[0], setNewRefName = newRefDraft[1], clearRefDraft = newRefDraft[2];
   var refSavingState = useState(false); var refSaving = refSavingState[0], setRefSaving = refSavingState[1];
   var refMsgState = useState(""); var refMsg = refMsgState[0], setRefMsg = refMsgState[1];
   var refOkState = useState(true); var refOk = refOkState[0], setRefOk = refOkState[1];
@@ -1402,10 +2437,24 @@ function AdvisorView(props) {
     setRefSaving(true);
     var res = await onAddReferral(newRefName);
     setRefSaving(false);
-    if (res && res.ok) { setNewRefName(""); setRefOk(true); setRefMsg("Added \u2014 your manager will confirm progress from here."); }
+    if (res && res.ok) { clearRefDraft(); setRefOk(true); setRefMsg("Added \u2014 your manager will confirm progress from here."); }
     else { setRefOk(false); setRefMsg((res && res.message) || "Couldn't save \u2014 check your connection and try again."); }
   };
  
+  // RULE 12: the note is written to this device on every keystroke and
+  // only cleared once it has actually been saved to Supabase. A null draft
+  // means "no unsaved edit", so the textarea falls back to the live value
+  // rather than ever overwriting a saved note with a stale empty string.
+  var noteDraft = useDraft("note-" + (myCode || "anon") + "-" + date, null);
+  var noteVal = noteDraft[0], setNoteVal = noteDraft[1], clearNoteDraft = noteDraft[2];
+  var noteHasDraft = noteVal !== null && noteVal !== undefined && noteVal !== (entry.note || "");
+  var noteText = (noteVal === null || noteVal === undefined) ? (entry.note || "") : noteVal;
+
+  // RULE 10: the referral list pages in ahead of the scroll instead of
+  // sitting inside a fixed-height inner scroller.
+  var sortedMyReferrals = myReferrals.slice().sort(function (a, b) { return daysSince(b.created_at) - daysSince(a.created_at); });
+  var refInc = useIncremental(sortedMyReferrals.length, 8, "myrefs", "advisor-referrals");
+
   var maxFunnel = Math.max.apply(null, [1].concat(funnelData.map(function (f) { return f.value; })));
   var myDaysLogged = myWeekDayLabels.length;
   var totalToday = entryTotal(entry);
@@ -1434,31 +2483,16 @@ function AdvisorView(props) {
   var projectedTotal = laneStatus.reduce(function (s, l) { return s + (l.leading ? l.amount : 0); }, 0);
   var leadingLanes = laneStatus.filter(function (l) { return l.leading; });
  
-  return h("div", { className: "px-5 mt-6 space-y-6" },
-    h("div", { className: "flex items-center justify-between" },
-      h("div", { style: { color: COLORS.slate }, className: "text-xs font-mono uppercase tracking-wide" }, prettyDate(date) + " \u00b7 " + teamCount + " logged in"),
-      h("button", { onClick: onRefresh, style: { color: COLORS.brass }, className: "text-xs font-mono" }, loading ? "\u2026" : "refresh")
-    ),
- 
-    h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4" },
-      h("div", { className: "flex items-start justify-between" },
-        h("div", null,
-          h("div", { style: { color: COLORS.slate }, className: "text-[11px] uppercase tracking-wide font-mono" }, "Incentive receivable"),
-          h("div", { style: { color: COLORS.brass }, className: "font-display text-3xl mt-1" }, fmtPhp(referralOwed))
-        ),
-        h("div", { style: { color: COLORS.slate }, className: "text-[10px] text-right leading-relaxed max-w-[110px]" }, "confirmed \u2014 earned, not yet paid out")
-      ),
-      projectedTotal > 0 && h("div", { style: { borderColor: COLORS.line }, className: "border-t mt-3 pt-3" },
-        h("div", { className: "flex items-center justify-between" },
-          h("div", { style: { color: COLORS.ink }, className: "text-sm font-medium" }, "+ " + fmtPhp(projectedTotal) + " projected"),
-          h("div", { style: { color: COLORS.slate }, className: "text-[10px]" }, "if leads hold to month end")
-        ),
-        h("div", { style: { color: COLORS.slate }, className: "text-[11px] mt-1" }, "Leading: " + leadingLanes.map(function (l) { return l.label; }).join(", "))
-      ),
-      referralOwed === 0 && projectedTotal === 0 && h("div", { style: { color: COLORS.slate }, className: "text-xs mt-2" }, "Nothing confirmed yet \u2014 keep logging and referring to build this up.")
-    ),
- 
-    h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-5 flex items-center gap-5" },
+  // ---- RULE 9 + Jakob's Law -------------------------------------------
+  // What used to be one very long scroll is now three bottom-tab
+  // destinations. The blocks themselves are byte-for-byte the same nodes;
+  // only which tab renders them has changed.
+  //   Today   — the daily loop: progress ring, logging controls, streak
+  //   Team    — everyone's numbers: totals, funnel, leaderboard, trend
+  //   Rewards — money and recognition: receivable, lanes, awards, referrals
+  var sectionBlocks = {
+    today: [
+      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-5 flex items-center gap-5" },
       h("div", { className: "relative shrink-0", style: { width: "108px", height: "108px" } },
         h("svg", { width: "108", height: "108", viewBox: "0 0 120 120" },
           h("circle", { cx: "60", cy: "60", r: "52", fill: "none", stroke: COLORS.parchment, strokeWidth: "10" }),
@@ -1489,111 +2523,8 @@ function AdvisorView(props) {
         full && h("div", { style: { background: "rgba(255,106,61,0.16)", color: COLORS.emphasis }, className: "inline-block text-[10px] font-semibold px-2.5 py-1 rounded-lg mt-2" }, "Daily pacesetter")
       )
     ),
- 
-    h("div", null,
-      h("div", { className: "flex items-baseline justify-between mb-2.5" },
-        h("span", { style: { color: COLORS.ink }, className: "font-display text-base" }, "Your growth investment"),
-        earnedTotal > 0 && h("span", { style: { color: COLORS.brass }, className: "font-display text-xl" }, fmtPhp(earnedTotal))
-      ),
-      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4 mb-2" },
-        h("div", { style: { color: COLORS.slate }, className: "text-xs font-mono uppercase tracking-wide mb-2" }, "Refer a candidate"),
-        h("div", { className: "flex gap-2" },
-          h("input", {
-            value: newRefName, onChange: function (ev) { setNewRefName(ev.target.value); },
-            onKeyDown: function (ev) { if (ev.key === "Enter") submitReferral(); },
-            placeholder: "Candidate's full name",
-            style: { borderColor: COLORS.line, background: COLORS.parchment, color: COLORS.ink }, className: "flex-1 px-3 py-2.5 rounded-xl border outline-none focus:ring-2 text-sm"
-          }),
-          h("button", { onClick: submitReferral, disabled: refSaving, style: { background: COLORS.emphasis }, className: "px-4 rounded-xl text-white text-sm font-medium" }, refSaving ? "\u2026" : "Add")
-        ),
-        refMsg && h("div", {
-          style: refOk ? { color: COLORS.good } : { background: "rgba(226,75,74,0.12)", borderColor: COLORS.rust, color: COLORS.rust },
-          className: refOk ? "text-[11px] mt-2" : "text-[11px] mt-2 rounded-lg border px-2.5 py-2 font-medium"
-        }, refMsg)
-      ),
-      myReferrals.length > 0 && h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border overflow-hidden" },
-        h("div", {
-          style: myReferrals.length > 4
-            ? { height: "340px", overflowY: "scroll", WebkitOverflowScrolling: "touch" }
-            : {},
-          className: "divide-y"
-        },
-          myReferrals.slice().sort(function (a, b) { return daysSince(b.created_at) - daysSince(a.created_at); }).map(function (r) {
-            var days = daysSince(r.created_at);
-            return h("div", { key: r.id, style: { borderColor: COLORS.line }, className: "px-4 py-3.5 flex items-center justify-between" },
-              h("div", null,
-                h("div", { style: { color: COLORS.ink }, className: "text-sm font-medium" }, r.candidate_name),
-                h("div", { style: { color: COLORS.slate }, className: "text-[11px] mt-0.5" }, referralStatus(r) + (days !== null ? " · day " + days : ""))
-              ),
-              h("div", { style: { background: "rgba(242,183,5,0.14)", color: COLORS.brass }, className: "font-display text-lg px-3 py-1 rounded-xl" }, fmtPhp(referralPayout(r)))
-            );
-          })
-        )
-      )
-    ),
- 
-    h("div", null,
-      h(SectionTitle, { label: "This month \u2014 three lanes" }),
-      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4 space-y-5" },
-        LANES.map(function (lane) {
-          var rows = monthBoards[lane.key] || [];
-          var topRow = rows.length ? rows[0] : null;
-          var mine = rows.filter(function (r) { return r.code === myCode; })[0];
-          var mineVal = mine ? mine[lane.key] : 0;
-          var leaderVal = topRow ? topRow[lane.key] : 0;
-          var max = Math.max(leaderVal, 1);
-          var fmt = lane.key === "grosser" ? fmtPhp : function (v) { return v; };
-          var iAmTop = !!(topRow && topRow.code === myCode && leaderVal > 0);
-          var qualifies = laneQualifies(topRow, lane.key);
-          var leading = iAmTop && qualifies;
-          var leadingButUnqualified = iAmTop && !qualifies;
-          var min = LANE_MINIMUMS[lane.key];
-          return h("div", { key: lane.key },
-            h("div", { className: "flex items-end justify-between mb-1" },
-              h("div", null,
-                h("div", { style: { color: COLORS.slate }, className: "text-[10px] uppercase tracking-wider font-mono" }, lane.label),
-                h("div", { style: { color: COLORS.ink }, className: "font-display text-2xl mt-0.5" }, fmt(mineVal))
-              ),
-              leading
-                ? h("span", { style: { background: "rgba(242,183,5,0.14)", color: COLORS.brass }, className: "text-[10px] font-semibold px-2 py-1 rounded-lg" }, "Leading")
-                : leadingButUnqualified
-                  ? h("span", { style: { background: "rgba(214,90,60,0.14)", color: COLORS.rust }, className: "text-[10px] font-semibold px-2 py-1 rounded-lg" }, "#1 \u2014 needs " + min + " to qualify")
-                  : h("span", { style: { color: COLORS.slate }, className: "text-[11px] font-mono" }, "leader " + fmt(leaderVal))
-            ),
-            h("div", { style: { color: COLORS.slate }, className: "text-[10px] mb-1.5" }, lane.hint),
-            h("div", { style: { background: COLORS.parchment }, className: "h-2 rounded-full overflow-hidden" },
-              h("div", { style: { width: Math.min(100, (mineVal / max) * 100) + "%", background: COLORS.brass }, className: "h-full rounded-full" })
-            )
-          );
-        })
-      )
-    ),
- 
-    h("div", null,
-      h(SectionTitle, { label: "Your Consistency" }),
-      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4" },
-        h("div", { className: "flex items-center gap-2 mb-4" },
-          WEEKDAYS.map(function (d) {
-            var on = myWeekDayLabels.indexOf(d) !== -1;
-            return h("div", { key: d, style: { background: on ? COLORS.emphasis : COLORS.parchment, color: on ? "white" : COLORS.slate, borderColor: COLORS.line }, className: "flex-1 rounded-xl border py-2 text-center text-[11px] font-mono" }, d);
-          }),
-          h("div", { style: { color: currentStreak >= 5 ? COLORS.good : COLORS.slate }, className: "text-xs font-mono ml-1 whitespace-nowrap" }, currentStreak + "-day streak")
-        ),
-        h("div", { className: "grid grid-cols-3 gap-2" },
-          BADGE_LEVELS.map(function (n) {
-            var earned = bestStreak >= n;
-            var toGo = Math.max(0, n - currentStreak);
-            return h("div", { key: n, style: { background: earned ? "rgba(242,183,5,0.14)" : COLORS.parchment, borderColor: earned ? COLORS.brass : COLORS.line }, className: "rounded-xl border py-2.5 text-center flex flex-col items-center gap-1" },
-              h(MedalIcon, { earned: earned }),
-              h("div", { style: { color: earned ? COLORS.brass : COLORS.ink }, className: "font-display text-sm" }, n + "-Day"),
-              h("div", { style: { color: earned ? COLORS.brass : COLORS.slate }, className: "text-[9px]" }, earned ? "Earned" : toGo + " to go")
-            );
-          })
-        )
-      )
-    ),
- 
-    h("div", null,
+
+      h("div", null,
       h(SectionTitle, { label: "Log today's activity" }),
       full && h("div", { style: { background: "rgba(45,212,191,0.10)", borderColor: COLORS.good, color: COLORS.good }, className: "rounded-2xl border p-3.5 text-xs mb-3 flex items-center gap-2" },
         h("span", null, "\u2713"),
@@ -1635,15 +2566,44 @@ function AdvisorView(props) {
         h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4" },
           h("div", { style: { color: COLORS.slate }, className: "text-xs font-mono uppercase tracking-wide mb-2" }, "Notes (optional)"),
           h("textarea", {
-            defaultValue: entry.note || "", onBlur: function (ev) { onNote(ev.target.value); }, placeholder: "Who did you talk to?",
+            value: noteText,
+            onChange: function (ev) { setNoteVal(ev.target.value); },
+            onBlur: function (ev) { onNote(ev.target.value); clearNoteDraft(); },
+            placeholder: "Who did you talk to?",
             style: { borderColor: COLORS.line, background: COLORS.parchment, color: COLORS.ink }, className: "w-full px-3 py-2.5 rounded-xl border outline-none focus:ring-2 text-sm resize-none", rows: 2
-          })
+          }),
+          noteHasDraft && h("div", { style: { color: COLORS.brass }, className: "text-[10px] font-mono mt-1.5" }, "Draft kept on this device \u2014 saves when you tap away")
         )
       ),
       h("div", { style: { color: COLORS.slate }, className: "text-center text-xs mt-4 font-mono" }, "Every tap saves instantly.")
     ),
- 
-    h("div", null,
+
+      h("div", null,
+      h(SectionTitle, { label: "Your Consistency" }),
+      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4" },
+        h("div", { className: "flex items-center gap-2 mb-4" },
+          WEEKDAYS.map(function (d) {
+            var on = myWeekDayLabels.indexOf(d) !== -1;
+            return h("div", { key: d, style: { background: on ? COLORS.emphasis : COLORS.parchment, color: on ? "white" : COLORS.slate, borderColor: COLORS.line }, className: "flex-1 rounded-xl border py-2 text-center text-[11px] font-mono" }, d);
+          }),
+          h("div", { style: { color: currentStreak >= 5 ? COLORS.good : COLORS.slate }, className: "text-xs font-mono ml-1 whitespace-nowrap" }, currentStreak + "-day streak")
+        ),
+        h("div", { className: "grid grid-cols-3 gap-2" },
+          BADGE_LEVELS.map(function (n) {
+            var earned = bestStreak >= n;
+            var toGo = Math.max(0, n - currentStreak);
+            return h("div", { key: n, style: { background: earned ? "rgba(242,183,5,0.14)" : COLORS.parchment, borderColor: earned ? COLORS.brass : COLORS.line }, className: "rounded-xl border py-2.5 text-center flex flex-col items-center gap-1" },
+              h(MedalIcon, { earned: earned }),
+              h("div", { style: { color: earned ? COLORS.brass : COLORS.ink }, className: "font-display text-sm" }, n + "-Day"),
+              h("div", { style: { color: earned ? COLORS.brass : COLORS.slate }, className: "text-[9px]" }, earned ? "Earned" : toGo + " to go")
+            );
+          })
+        )
+      )
+    )
+    ],
+    team: [
+      h("div", null,
       h(SectionTitle, { label: "Team today" }),
       h("div", { className: "grid grid-cols-2 gap-3" },
         METRICS.map(function (m) {
@@ -1655,8 +2615,114 @@ function AdvisorView(props) {
       ),
       h("div", { style: { background: COLORS.emphasis }, className: "rounded-2xl px-4 py-3 text-white text-sm mt-3" }, socialToday + " advisor" + (socialToday !== 1 ? "s" : "") + " posted on social media today")
     ),
- 
-    h("div", null,
+
+      h("div", null,
+      h(SectionTitle, { label: "Today's funnel" }),
+      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4 space-y-2.5" },
+        funnelData.map(function (f) {
+          return h("div", { key: f.key, className: "flex items-center gap-3" },
+            h("div", { style: { color: COLORS.slate }, className: "text-xs w-24 shrink-0" }, f.short),
+            h("div", { style: { background: COLORS.parchment }, className: "flex-1 h-6 rounded-full overflow-hidden" },
+              h("div", { style: { width: (f.value / maxFunnel) * 100 + "%", background: COLORS.brass, minWidth: f.value > 0 ? "8%" : "0%" }, className: "h-full rounded-full" })
+            ),
+            h("div", { style: { color: COLORS.ink }, className: "font-mono text-sm w-6 text-right" }, f.value)
+          );
+        })
+      )
+    ),
+
+      h("div", null,
+      h(SectionTitle, { label: "This week's leaderboard" }),
+      leaderboard.length === 0
+        ? (loading && !hasTeamData
+            ? h(SkeletonList, { rows: 4 })
+            : h("div", { style: { background: COLORS.card, borderColor: COLORS.line, color: COLORS.slate }, className: "rounded-2xl border p-5 text-sm text-center" }, "No activity logged yet this week."))
+        : h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border divide-y" },
+            leaderboard.map(function (row, i) {
+              return h("div", { key: row.code, style: { borderColor: COLORS.line, background: row.code === myCode ? "rgba(255,106,61,0.07)" : "transparent" }, className: "flex items-center gap-3 px-4 py-3" },
+                h("div", { style: { background: i === 0 ? COLORS.brass : COLORS.parchment, color: i === 0 ? COLORS.parchment : COLORS.slate }, className: "font-mono text-xs w-6 h-6 rounded-full flex items-center justify-center shrink-0" }, i + 1),
+                h("div", { style: { color: COLORS.ink }, className: "font-medium text-sm flex-1" }, row.name),
+                h("div", { className: "flex gap-3 font-mono text-xs", style: { color: COLORS.slate } },
+                  h("span", null, (row.appts || 0) + " appt"),
+                  h("span", { style: { color: COLORS.brass, fontWeight: 600 } }, (row.closed || 0) + " closed")
+                )
+              );
+            })
+          )
+    ),
+
+      h("div", null,
+      h(SectionTitle, { label: "7-day trend \u2014 team totals" }),
+      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4" },
+        h(TrendChart, { data: trendData }),
+        h("div", { className: "flex flex-wrap gap-3 mt-2 justify-center" },
+          METRICS.map(function (m) {
+            return h("div", { key: m.key, className: "flex items-center gap-1.5" },
+              h("div", { style: { background: m.color }, className: "w-2.5 h-2.5 rounded-full" }),
+              h("span", { style: { color: COLORS.slate }, className: "text-[11px]" }, m.short)
+            );
+          })
+        )
+      )
+    )
+    ],
+    rewards: [
+      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4" },
+      h("div", { className: "flex items-start justify-between" },
+        h("div", null,
+          h("div", { style: { color: COLORS.slate }, className: "text-[11px] uppercase tracking-wide font-mono" }, "Incentive receivable"),
+          h("div", { style: { color: COLORS.brass }, className: "font-display text-3xl mt-1" }, fmtPhp(referralOwed))
+        ),
+        h("div", { style: { color: COLORS.slate }, className: "text-[10px] text-right leading-relaxed max-w-[110px]" }, "confirmed \u2014 earned, not yet paid out")
+      ),
+      projectedTotal > 0 && h("div", { style: { borderColor: COLORS.line }, className: "border-t mt-3 pt-3" },
+        h("div", { className: "flex items-center justify-between" },
+          h("div", { style: { color: COLORS.ink }, className: "text-sm font-medium" }, "+ " + fmtPhp(projectedTotal) + " projected"),
+          h("div", { style: { color: COLORS.slate }, className: "text-[10px]" }, "if leads hold to month end")
+        ),
+        h("div", { style: { color: COLORS.slate }, className: "text-[11px] mt-1" }, "Leading: " + leadingLanes.map(function (l) { return l.label; }).join(", "))
+      ),
+      referralOwed === 0 && projectedTotal === 0 && h("div", { style: { color: COLORS.slate }, className: "text-xs mt-2" }, "Nothing confirmed yet \u2014 keep logging and referring to build this up.")
+    ),
+
+      h("div", null,
+      h(SectionTitle, { label: "This month \u2014 three lanes" }),
+      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4 space-y-5" },
+        LANES.map(function (lane) {
+          var rows = monthBoards[lane.key] || [];
+          var topRow = rows.length ? rows[0] : null;
+          var mine = rows.filter(function (r) { return r.code === myCode; })[0];
+          var mineVal = mine ? mine[lane.key] : 0;
+          var leaderVal = topRow ? topRow[lane.key] : 0;
+          var max = Math.max(leaderVal, 1);
+          var fmt = lane.key === "grosser" ? fmtPhp : function (v) { return v; };
+          var iAmTop = !!(topRow && topRow.code === myCode && leaderVal > 0);
+          var qualifies = laneQualifies(topRow, lane.key);
+          var leading = iAmTop && qualifies;
+          var leadingButUnqualified = iAmTop && !qualifies;
+          var min = LANE_MINIMUMS[lane.key];
+          return h("div", { key: lane.key },
+            h("div", { className: "flex items-end justify-between mb-1" },
+              h("div", null,
+                h("div", { style: { color: COLORS.slate }, className: "text-[10px] uppercase tracking-wider font-mono" }, lane.label),
+                h("div", { style: { color: COLORS.ink }, className: "font-display text-2xl mt-0.5" }, fmt(mineVal))
+              ),
+              leading
+                ? h("span", { style: { background: "rgba(242,183,5,0.14)", color: COLORS.brass }, className: "text-[10px] font-semibold px-2 py-1 rounded-lg" }, "Leading")
+                : leadingButUnqualified
+                  ? h("span", { style: { background: "rgba(214,90,60,0.14)", color: COLORS.rust }, className: "text-[10px] font-semibold px-2 py-1 rounded-lg" }, "#1 \u2014 needs " + min + " to qualify")
+                  : h("span", { style: { color: COLORS.slate }, className: "text-[11px] font-mono" }, "leader " + fmt(leaderVal))
+            ),
+            h("div", { style: { color: COLORS.slate }, className: "text-[10px] mb-1.5" }, lane.hint),
+            h("div", { style: { background: COLORS.parchment }, className: "h-2 rounded-full overflow-hidden" },
+              h("div", { style: { width: Math.min(100, (mineVal / max) * 100) + "%", background: COLORS.brass }, className: "h-full rounded-full" })
+            )
+          );
+        })
+      )
+    ),
+
+      h("div", null,
       h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4 mb-1" },
         h("div", { style: { color: COLORS.slate }, className: "text-[10px] font-mono uppercase tracking-wide mb-2" }, "My Recognition"),
         (function() {
@@ -1669,6 +2735,7 @@ function AdvisorView(props) {
             return (awardProgress || []).some(function(p) { return p.advisor_code === myCode && p.award_type === a.type && p.current_tier; });
           });
           if (!hasAny) {
+            if (loading && !(awardProgress || []).length) return h("div", { className: "space-y-2" }, h(Skeleton, { h: "12px", w: "60%" }), h(Skeleton, { h: "12px", w: "38%" }));
             return h("div", { style: { color: COLORS.slate }, className: "text-[12px]" }, "No tiers earned yet this period. Keep going!");
           }
           return h("div", { className: "flex flex-wrap gap-2" },
@@ -1700,52 +2767,63 @@ function AdvisorView(props) {
           );
         })()
       ),
-      h(SectionTitle, { label: "Today's funnel" }),
-      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4 space-y-2.5" },
-        funnelData.map(function (f) {
-          return h("div", { key: f.key, className: "flex items-center gap-3" },
-            h("div", { style: { color: COLORS.slate }, className: "text-xs w-24 shrink-0" }, f.short),
-            h("div", { style: { background: COLORS.parchment }, className: "flex-1 h-6 rounded-full overflow-hidden" },
-              h("div", { style: { width: (f.value / maxFunnel) * 100 + "%", background: COLORS.brass, minWidth: f.value > 0 ? "8%" : "0%" }, className: "h-full rounded-full" })
-            ),
-            h("div", { style: { color: COLORS.ink }, className: "font-mono text-sm w-6 text-right" }, f.value)
-          );
-        })
-      )
     ),
- 
-    h("div", null,
-      h(SectionTitle, { label: "This week's leaderboard" }),
-      leaderboard.length === 0
-        ? h("div", { style: { background: COLORS.card, borderColor: COLORS.line, color: COLORS.slate }, className: "rounded-2xl border p-5 text-sm text-center" }, "No activity logged yet this week.")
-        : h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border divide-y" },
-            leaderboard.map(function (row, i) {
-              return h("div", { key: row.code, style: { borderColor: COLORS.line, background: row.code === myCode ? "rgba(255,106,61,0.07)" : "transparent" }, className: "flex items-center gap-3 px-4 py-3" },
-                h("div", { style: { background: i === 0 ? COLORS.brass : COLORS.parchment, color: i === 0 ? COLORS.parchment : COLORS.slate }, className: "font-mono text-xs w-6 h-6 rounded-full flex items-center justify-center shrink-0" }, i + 1),
-                h("div", { style: { color: COLORS.ink }, className: "font-medium text-sm flex-1" }, row.name),
-                h("div", { className: "flex gap-3 font-mono text-xs", style: { color: COLORS.slate } },
-                  h("span", null, (row.appts || 0) + " appt"),
-                  h("span", { style: { color: COLORS.brass, fontWeight: 600 } }, (row.closed || 0) + " closed")
-                )
-              );
-            })
-          )
-    ),
- 
-    h("div", null,
-      h(SectionTitle, { label: "7-day trend \u2014 team totals" }),
-      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4" },
-        h(TrendChart, { data: trendData }),
-        h("div", { className: "flex flex-wrap gap-3 mt-2 justify-center" },
-          METRICS.map(function (m) {
-            return h("div", { key: m.key, className: "flex items-center gap-1.5" },
-              h("div", { style: { background: m.color }, className: "w-2.5 h-2.5 rounded-full" }),
-              h("span", { style: { color: COLORS.slate }, className: "text-[11px]" }, m.short)
-            );
+
+      h("div", null,
+      h("div", { className: "flex items-baseline justify-between mb-2.5" },
+        h("span", { style: { color: COLORS.ink }, className: "font-display text-base" }, "Your growth investment"),
+        earnedTotal > 0 && h("span", { style: { color: COLORS.brass }, className: "font-display text-xl" }, fmtPhp(earnedTotal))
+      ),
+      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4 mb-2" },
+        h("div", { style: { color: COLORS.slate }, className: "text-xs font-mono uppercase tracking-wide mb-2" }, "Refer a candidate"),
+        h("div", { className: "flex gap-2" },
+          h("input", {
+            value: newRefName, onChange: function (ev) { setNewRefName(ev.target.value); },
+            onKeyDown: function (ev) { if (ev.key === "Enter") submitReferral(); },
+            placeholder: "Candidate's full name",
+            style: { borderColor: COLORS.line, background: COLORS.parchment, color: COLORS.ink }, className: "flex-1 px-3 py-2.5 rounded-xl border outline-none focus:ring-2 text-sm"
+          }),
+          h(BusyButton, {
+            onClick: submitReferral, busy: refSaving, busyLabel: "Adding", label: "Add",
+            className: "px-4 rounded-xl text-white text-sm font-medium shrink-0"
           })
+        ),
+        refMsg && h("div", {
+          style: refOk ? { color: COLORS.good } : { background: "rgba(226,75,74,0.12)", borderColor: COLORS.rust, color: COLORS.rust },
+          className: refOk ? "text-[11px] mt-2" : "text-[11px] mt-2 rounded-lg border px-2.5 py-2 font-medium"
+        }, refMsg)
+      ),
+      sortedMyReferrals.length > 0 && h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border overflow-hidden" },
+        h("div", { className: "divide-y" },
+          sortedMyReferrals.slice(0, refInc.count).map(function (r) {
+            var days = daysSince(r.created_at);
+            return h("div", { key: r.id, style: { borderColor: COLORS.line, opacity: r._pending ? 0.6 : 1 }, className: "px-4 py-3.5 flex items-center justify-between" },
+              h("div", null,
+                h("div", { style: { color: COLORS.ink }, className: "text-sm font-medium" }, r.candidate_name),
+                h("div", { style: { color: COLORS.slate }, className: "text-[11px] mt-0.5" },
+                  r._pending ? "Saving\u2026" : (referralStatus(r) + (days !== null ? " \u00b7 day " + days : "")))
+              ),
+              h("div", { style: { background: "rgba(242,183,5,0.14)", color: COLORS.brass }, className: "font-display text-lg px-3 py-1 rounded-xl" }, fmtPhp(referralPayout(r)))
+            );
+          }),
+          refInc.sentinel
         )
       )
     )
+    ]
+  };
+
+  var chosen = (sectionBlocks[section] || sectionBlocks.today).filter(Boolean);
+
+  return h("div", { className: "px-5 mt-6 space-y-6" },
+    h("div", { className: "flex items-center justify-between" },
+      h("div", { style: { color: COLORS.slate }, className: "text-xs font-mono uppercase tracking-wide" }, prettyDate(date) + " \u00b7 " + teamCount + " logged in"),
+      h("button", { onClick: onRefresh, disabled: loading, style: { color: COLORS.brass }, className: "text-xs font-mono flex items-center gap-1.5" },
+        loading ? h(Spinner, { size: 11, color: COLORS.brass }) : null,
+        loading ? "refreshing" : "refresh")
+    ),
+    chosen.map(function (node, idx) { return h("div", { key: section + "-" + idx }, node); }),
+    h("div", { style: { height: "8px" } })
   );
 }
  
@@ -1837,17 +2915,33 @@ function ManagerView(props) {
     pendingRoster = props.pendingRoster || [], onAddAdvisor = props.onAddAdvisor,
     onApproveAdvisor = props.onApproveAdvisor, onRejectAdvisor = props.onRejectAdvisor,
     myCode = props.myCode;
-  var selectedState = useState(null); var selected = selectedState[0], setSelected = selectedState[1];
-  var showAddSubState = useState(false); var showAddSub = showAddSubState[0], setShowAddSub = showAddSubState[1];
+
+  // RULES 6, 14 and 15: every overlay in this view is addressable in the
+  // URL and dismissed by going back one history entry, so ✕, a downward
+  // swipe and the hardware Back button are all literally the same action.
+  var route = props.route || {};
+  var navigate = props.navigate || function () {};
+  var closeSheet = props.closeSheet || function () {};
+  var selected = route.advisor || null;
+  var openSheet = route.sheet || null;
+  var showAddSub = openSheet === "addsub";
+  var showAddAdvisor = openSheet === "addadvisor";
+  var showExport = openSheet === "export";
+
   var recTabState = useState("medallion"); var recTab = recTabState[0], setRecTab = recTabState[1];
-  var addAdvisorState = useState(false); var showAddAdvisor = addAdvisorState[0], setShowAddAdvisor = addAdvisorState[1];
   var editState = useState(false); var editingTargets = editState[0], setEditingTargets = editState[1];
   var draftState = useState(targets); var draft = draftState[0], setDraft = draftState[1];
-  var exportState = useState(false); var showExport = exportState[0], setShowExport = exportState[1];
-  var lbTabState = useState("pipeline"); var lbTab = lbTabState[0], setLbTab = lbTabState[1];
+  var lbTabState = useState(route.lane || "pipeline"); var lbTab = lbTabState[0], setLbTab = lbTabState[1];
   var openRecState = useState(null); var openRec = openRecState[0], setOpenRec = openRecState[1];
-  var searchState = useState(""); var search = searchState[0], setSearch = searchState[1];
+  var searchState = useState(route.q || ""); var search = searchState[0], setSearch = searchState[1];
   var showRemovedState = useState(false); var showRemoved = showRemovedState[0], setShowRemoved = showRemovedState[1];
+
+  // A search arriving from a shared link or the header search sheet must
+  // land on the filtered list, not on an unfiltered dashboard (rule 15).
+  useEffect(function () {
+    if (route.q && route.q !== search) setSearch(route.q);
+    // eslint-disable-next-line
+  }, [route.q]);
  
   // Fires once when the Manager view mounts, capturing the default tab
   // ("pipeline") \u2014 without this, a manager who never taps a different
@@ -1871,45 +2965,83 @@ function ManagerView(props) {
     return rows.map(function (r) { return r.join(","); }).join("\n");
   }, [teamEntries, roster]);
  
+  // RULE 14: an advisor row is a quick contextual action, so it opens a
+  // bottom sheet rather than pushing the rest of the list down.
   var renderAdvisorRow = function (r) {
     var todayEntry = teamEntries.filter(function (e) { return e.advisor_code === r.code && e.entry_date === date; })[0];
     var total = entryTotal(todayEntry);
-    var isOpen = selected === r.code;
-    var history = teamEntries.filter(function (e) { return e.advisor_code === r.code; }).sort(function (a, b) { return a.entry_date < b.entry_date ? 1 : -1; }).slice(0, 14);
     return h("div", { key: r.code, style: { opacity: r.active === false ? 0.55 : 1 } },
-      h("button", { onClick: function () { setSelected(isOpen ? null : r.code); }, className: "w-full px-4 py-3 flex items-center gap-3 text-left" },
-        h("span", { style: { color: r.active === false ? COLORS.slate : (total > 0 ? COLORS.good : COLORS.rust) } }, "●"),
-        h("div", { className: "flex-1" },
-          h("div", { style: { color: COLORS.ink }, className: "font-medium text-sm" }, r.name + (r.active === false ? " (removed)" : "")),
+      h("button", {
+        onClick: function () { navigate({ advisor: r.code }, true); },
+        "aria-label": "Open " + r.name + "'s history",
+        className: "w-full px-4 py-3 flex items-center gap-3 text-left active:opacity-70"
+      },
+        h("span", { style: { color: r.active === false ? COLORS.slate : (total > 0 ? COLORS.good : COLORS.rust) } }, "\u25cf"),
+        h("div", { className: "flex-1 min-w-0" },
+          h("div", { style: { color: COLORS.ink }, className: "font-medium text-sm truncate" }, r.name + (r.active === false ? " (removed)" : "")),
           h("div", { style: { color: COLORS.slate }, className: "font-mono text-[10px]" }, total + " logged today")
         ),
-        h("span", { style: { color: COLORS.slate } }, isOpen ? "▾" : "▸")
-      ),
-      isOpen && h("div", { style: { background: COLORS.parchment }, className: "px-4 pb-3 space-y-2" },
-        h("button", {
-          onClick: function () {
-            var msg = r.active === false ? "Restore " + r.name + " to the active team?" : "Remove " + r.name + " from the team? Their history stays intact and can be restored later.";
-            if (window.confirm(msg)) onSetAdvisorActive(r.code, r.active === false);
-          },
-          style: { borderColor: r.active === false ? COLORS.good : COLORS.rust, color: r.active === false ? COLORS.good : COLORS.rust },
-          className: "w-full py-2 rounded-xl border text-xs font-medium mb-2"
-        }, r.active === false ? "Restore to team" : "Remove from team"),
-        history.length === 0
-          ? h("div", { style: { color: COLORS.slate }, className: "text-xs py-2" }, "No history yet.")
-          : history.map(function (e) {
-              return h("div", { key: e.id, style: { borderColor: COLORS.line }, className: "border rounded-xl p-2.5" },
-                h("div", { className: "flex items-center justify-between mb-1.5" },
-                  h("span", { style: { color: COLORS.ink }, className: "font-mono text-[11px] font-semibold" }, shortDate(e.entry_date)),
-                  h("span", { style: { color: COLORS.brass }, className: "font-mono text-[11px]" }, entryTotal(e) + " total")
-                ),
-                e.note && h("div", { style: { color: COLORS.slate }, className: "text-[11px] italic" }, '"' + e.note + '"')
-              );
-            })
+        h("span", { style: { color: COLORS.slate } }, "\u203a")
       )
     );
   };
+
+  var selectedAdvisor = selected ? roster.filter(function (r) { return r.code === selected; })[0] : null;
+  var advisorDetailSheet = selectedAdvisor ? (function (r) {
+    var history = teamEntries.filter(function (e) { return e.advisor_code === r.code; }).sort(function (a, b) { return a.entry_date < b.entry_date ? 1 : -1; }).slice(0, 14);
+    return h(BottomSheet, {
+      title: r.name,
+      subtitle: (r.code || "") + (r.active === false ? " \u00b7 removed from the team" : ""),
+      onClose: closeSheet
+    },
+      h("button", {
+        onClick: function () {
+          var msg = r.active === false ? "Restore " + r.name + " to the active team?" : "Remove " + r.name + " from the team? Their history stays intact and can be restored later.";
+          if (window.confirm(msg)) { onSetAdvisorActive(r.code, r.active === false); closeSheet(); }
+        },
+        style: { borderColor: r.active === false ? COLORS.good : COLORS.rust, color: r.active === false ? COLORS.good : COLORS.rust },
+        className: "w-full py-2.5 rounded-xl border text-xs font-medium mb-3"
+      }, r.active === false ? "Restore to team" : "Remove from team"),
+      h("div", { style: { color: COLORS.slate }, className: "text-[10px] font-mono uppercase tracking-widest mb-2" }, "Last 14 logged days"),
+      history.length === 0
+        ? (loading && !teamEntries.length
+            ? h(SkeletonList, { rows: 3 })
+            : h("div", { style: { color: COLORS.slate }, className: "text-xs py-2" }, "No history yet."))
+        : h("div", { className: "space-y-2" }, history.map(function (e) {
+            return h("div", { key: e.id, style: { borderColor: COLORS.line }, className: "border rounded-xl p-2.5" },
+              h("div", { className: "flex items-center justify-between mb-1.5" },
+                h("span", { style: { color: COLORS.ink }, className: "font-mono text-[11px] font-semibold" }, shortDate(e.entry_date)),
+                h("span", { style: { color: COLORS.brass }, className: "font-mono text-[11px]" }, entryTotal(e) + " total")
+              ),
+              e.note && h("div", { style: { color: COLORS.slate }, className: "text-[11px] italic" }, '"' + e.note + '"')
+            );
+          }))
+    );
+  })(selectedAdvisor) : null;
   var activeAdvisors = roster.filter(function (r) { return r.active !== false; });
   var removedAdvisors = roster.filter(function (r) { return r.active === false; });
+
+  // ---- RULE 10: every long list in this view pages in ahead of the fold.
+  var searchTerm = search.trim().toLowerCase();
+  var filteredReferrals = (!searchTerm ? referrals : referrals.filter(function (r) {
+    var recipient = roster.filter(function (a) { return a.code === r.recipient_code; })[0];
+    return String(r.candidate_name || "").toLowerCase().indexOf(searchTerm) !== -1 ||
+      (recipient && String(recipient.name || "").toLowerCase().indexOf(searchTerm) !== -1);
+  })).slice().sort(function (a, b) {
+    var aDays = daysSince(a.created_at), bDays = daysSince(b.created_at);
+    var aFlag = !a.retained_90 && aDays !== null && aDays >= 90;
+    var bFlag = !b.retained_90 && bDays !== null && bDays >= 90;
+    if (aFlag !== bFlag) return aFlag ? -1 : 1;
+    return (bDays || 0) - (aDays || 0);
+  });
+  var settledSubs = submissions.filter(function (x) { return x.settled; });
+
+  var refInc = useIncremental(filteredReferrals.length, 8, searchTerm, "mgr-referrals");
+  var advInc = useIncremental(activeAdvisors.length, 10, roster.length, "mgr-advisors");
+  var consInc = useIncremental(activeAdvisors.length, 6, roster.length, "mgr-consistency");
+  var settledInc = useIncremental(settledSubs.length, 10, submissions.length, "mgr-settled");
+
+  var listIsCold = !!loading && teamEntries.length === 0;
  
   // 30-day consistency grid: one cell per calendar day (oldest \u2192 today),
   // built entirely from teamEntries already in memory \u2014 no extra fetch.
@@ -1985,7 +3117,29 @@ function ManagerView(props) {
   return h("div", { className: "px-5 mt-6 space-y-6" },
     h("div", { className: "flex items-center justify-between" },
       h("div", { style: { color: COLORS.slate }, className: "text-xs font-mono uppercase tracking-wide" }, "Manager view"),
-      h("button", { onClick: onRefresh, style: { color: COLORS.brass }, className: "text-xs font-mono" }, loading ? "…" : "refresh")
+      h("button", { onClick: onRefresh, disabled: loading, style: { color: COLORS.brass }, className: "text-xs font-mono flex items-center gap-1.5" },
+        loading ? h(Spinner, { size: 11, color: COLORS.brass }) : null,
+        loading ? "refreshing" : "refresh")
+    ),
+
+    // Jakob's Law: search sits at the top of the view and stays there.
+    h("div", { className: "sticky top-0 z-30 -mx-5 px-5 pt-1 pb-2.5", style: { background: COLORS.parchment } },
+      h("div", { className: "flex gap-2" },
+        h("input", {
+          value: search,
+          onChange: function (ev) { setSearch(ev.target.value); },
+          placeholder: "Search advisors or candidates\u2026",
+          "aria-label": "Search advisors or referral candidates",
+          style: { borderColor: COLORS.line, background: COLORS.card, color: COLORS.ink },
+          className: "flex-1 px-3.5 py-2.5 rounded-xl border outline-none focus:ring-2 text-sm"
+        }),
+        search && h("button", {
+          onClick: function () { setSearch(""); if (route.q) navigate({ q: null }, false); },
+          "aria-label": "Clear search",
+          style: { borderColor: COLORS.line, color: COLORS.slate },
+          className: "px-3 rounded-xl border text-sm shrink-0"
+        }, "\u2715")
+      )
     ),
     h("div", { style: { background: COLORS.emphasis }, className: "rounded-2xl p-4 flex items-baseline justify-between" },
       h("span", { className: "text-white font-display text-2xl" }, loggedTodayCount + "/" + activeRoster.length),
@@ -1993,7 +3147,7 @@ function ManagerView(props) {
     ),
     h("div", null,
       h(SectionTitle, { label: "Today's Momentum" }),
-      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border divide-y" },
+      listIsCold ? h(SkeletonList, { rows: 4 }) : h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border divide-y" },
         activeRoster.map(function (r) {
           var e = todayRows.filter(function (x) { return x.advisor_code === r.code; })[0];
           var full = isFullFunnel(e);
@@ -2022,10 +3176,10 @@ function ManagerView(props) {
       h(SectionTitle, { label: "30-Day Consistency" }),
       h("div", { style: { color: COLORS.slate }, className: "text-[11px] leading-relaxed mb-2.5" },
         "Left to right = last 30 days, oldest to today. Gold = full funnel, teal = logged, dim = missed, hollow = before they joined. Each advisor is scored only against the weekdays they've actually been on the system, so a new advisor isn't penalised for days that weren't theirs to miss."),
-      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border divide-y" },
+      listIsCold ? h(SkeletonList, { rows: 4 }) : h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border divide-y" },
         activeAdvisors.length === 0
           ? h("div", { style: { color: COLORS.slate }, className: "p-4 text-sm text-center" }, "No active advisors.")
-          : activeAdvisors.map(function (r) {
+          : activeAdvisors.slice(0, consInc.count).map(function (r) {
               var stats = consistencyStats(r);
               var pct = stats.eligibleWeekdays > 0
                 ? Math.round((stats.loggedWeekdays / stats.eligibleWeekdays) * 100)
@@ -2069,7 +3223,8 @@ function ManagerView(props) {
                   })
                 )
               );
-            })
+            }),
+        consInc.sentinel
       )
     ),
     h("div", null,
@@ -2155,7 +3310,9 @@ function ManagerView(props) {
           settled.length > 0 && h("div", null,
             h("div", { style: { color: COLORS.good }, className: "text-[11px] font-mono uppercase tracking-wide mb-1.5" },
               "Settled \u00b7 " + settled.length + " \u00b7 " + fmtPhp(settled.reduce(function (t, s) { return t + Number(s.amount || 0); }, 0))),
-            h("div", { className: "space-y-2" }, settled.slice(0, 10).map(function (s) { return row(s, false); }))
+            h("div", { className: "space-y-2" },
+              settled.slice(0, settledInc.count).map(function (s) { return row(s, false); }),
+              settledInc.sentinel)
           )
         );
       })()
@@ -2166,16 +3323,10 @@ function ManagerView(props) {
         h("div", { style: { color: COLORS.slate }, className: "text-[11px] leading-relaxed" },
           "Log a policy on behalf of an advisor. Serial must be unique per advisor."),
         h("button", {
-          onClick: function () { setShowAddSub(!showAddSub); },
+          onClick: function () { navigate({ sheet: "addsub" }, true); },
           style: { color: COLORS.brass }, className: "text-xs font-mono shrink-0 ml-2"
-        }, showAddSub ? "cancel" : "+ add")
-      ),
-      showAddSub && h(ManagerAddSubmissionForm, {
-        roster: activeRoster,
-        onAdd: onAddManagerSubmission,
-        onDone: function () { setShowAddSub(false); },
-        colors: COLORS
-      })
+        }, "+ add")
+      )
     ),
     h("div", null,
       h(SectionTitle, { label: "Recognition" }),
@@ -2242,7 +3393,12 @@ function ManagerView(props) {
       h("div", { className: "flex gap-2 mb-2.5" },
         LANES.map(function (lane) {
           return h("button", {
-            key: lane.key, onClick: function () { setLbTab(lane.key); logEvent("leaderboard_viewed", myCode, { view: "manager", lane: lane.key }); },
+            key: lane.key,
+            onClick: function () {
+              setLbTab(lane.key);
+              navigate({ lane: lane.key }, false);
+              logEvent("leaderboard_viewed", myCode, { view: "manager", lane: lane.key });
+            },
             style: { background: lbTab === lane.key ? COLORS.brass : COLORS.card, color: lbTab === lane.key ? "white" : COLORS.slate, borderColor: COLORS.line },
             className: "px-3 py-1.5 rounded-full border text-xs font-medium"
           }, lane.label);
@@ -2319,36 +3475,20 @@ function ManagerView(props) {
     ),
     h("div", null,
       h(SectionTitle, { label: "Growth Investment Tracker" }),
-      referrals.length > 0 && h("input", {
-        value: search, onChange: function (ev) { setSearch(ev.target.value); },
-        placeholder: "Search candidate or advisor name",
-        style: { borderColor: COLORS.line, background: COLORS.card, color: COLORS.ink }, className: "w-full px-3 py-2.5 rounded-xl border outline-none focus:ring-2 text-sm mb-2.5"
-      }),
       (function () {
-        var q = search.trim().toLowerCase();
-        var filtered = !q ? referrals : referrals.filter(function (r) {
-          var recipient = roster.filter(function (a) { return a.code === r.recipient_code; })[0];
-          return r.candidate_name.toLowerCase().indexOf(q) !== -1 || (recipient && recipient.name.toLowerCase().indexOf(q) !== -1);
-        });
-        filtered = filtered.slice().sort(function (a, b) {
-          var aDays = daysSince(a.created_at), bDays = daysSince(b.created_at);
-          var aFlag = !a.retained_90 && aDays !== null && aDays >= 90;
-          var bFlag = !b.retained_90 && bDays !== null && bDays >= 90;
-          if (aFlag !== bFlag) return aFlag ? -1 : 1;
-          return (bDays || 0) - (aDays || 0);
-        });
-        if (referrals.length === 0) return h("div", { style: { background: COLORS.card, borderColor: COLORS.line, color: COLORS.slate }, className: "rounded-2xl border p-5 text-sm text-center" }, "No referral candidates yet.");
+        var q = searchTerm;
+        var filtered = filteredReferrals;
+        if (referrals.length === 0) {
+          return listIsCold
+            ? h(SkeletonList, { rows: 3 })
+            : h("div", { style: { background: COLORS.card, borderColor: COLORS.line, color: COLORS.slate }, className: "rounded-2xl border p-5 text-sm text-center" }, "No referral candidates yet.");
+        }
         if (filtered.length === 0) return h("div", { style: { background: COLORS.card, borderColor: COLORS.line, color: COLORS.slate }, className: "rounded-2xl border p-5 text-sm text-center" }, "No match for \u201c" + search + "\u201d.");
         return h("div", null,
           h("div", { style: { color: COLORS.slate }, className: "text-[11px] font-mono mb-1.5" }, filtered.length + (filtered.length === referrals.length ? " total" : " of " + referrals.length) + " \u00b7 newest / needs-review first"),
           h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border overflow-hidden" },
-            h("div", {
-              style: filtered.length > 4
-                ? { height: "460px", overflowY: "scroll", WebkitOverflowScrolling: "touch" }
-                : {},
-              className: "divide-y"
-            },
-              filtered.map(function (r) {
+            h("div", { className: "divide-y" },
+              filtered.slice(0, refInc.count).map(function (r) {
               var recipient = roster.filter(function (a) { return a.code === r.recipient_code; })[0];
               var days = daysSince(r.created_at);
               var needsReview = !r.retained_90 && days !== null && days >= 90;
@@ -2405,20 +3545,29 @@ function ManagerView(props) {
                   className: "text-[11px] border rounded-lg px-2.5 py-1 mt-1"
                 }, "Remove candidate")
               );
-            })
+            }),
+              refInc.sentinel
             )
           )
         );
       })()
     ),
-    h(AddAdvisorCard, { open: showAddAdvisor, onToggle: function () { setShowAddAdvisor(!showAddAdvisor); }, onAddAdvisor: onAddAdvisor }),
+    h("div", null,
+      h("div", { className: "flex items-center justify-between mb-2.5" },
+        h(SectionTitle, { label: "Add Advisor", bare: true }),
+        h("button", { onClick: function () { navigate({ sheet: "addadvisor" }, true); }, style: { color: COLORS.brass }, className: "text-xs font-mono" }, "+ add")
+      ),
+      h("div", { style: { color: COLORS.slate }, className: "text-[11px] leading-relaxed" },
+        "Creates the account directly \u2014 no approval step, since you're the one adding it.")
+    ),
     pendingRoster.length > 0 && h(PendingApprovalCard, { pendingRoster: pendingRoster, onApprove: onApproveAdvisor, onReject: onRejectAdvisor }),
     h("div", null,
       h(SectionTitle, { label: "Advisors" }),
-      h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border divide-y" },
+      listIsCold ? h(SkeletonList, { rows: 5 }) : h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border divide-y" },
         activeAdvisors.length > 0
-          ? activeAdvisors.map(renderAdvisorRow)
-          : h("div", { style: { color: COLORS.slate }, className: "p-4 text-sm text-center" }, "No active advisors.")
+          ? activeAdvisors.slice(0, advInc.count).map(renderAdvisorRow)
+          : h("div", { style: { color: COLORS.slate }, className: "p-4 text-sm text-center" }, "No active advisors."),
+        advInc.sentinel
       ),
       removedAdvisors.length > 0 && h("div", { className: "mt-2" },
         h("button", {
@@ -2431,20 +3580,59 @@ function ManagerView(props) {
         )
       )
     ),
-    h("button", { onClick: function () { setShowExport(true); }, style: { borderColor: COLORS.line, color: COLORS.ink }, className: "w-full py-3 rounded-2xl border font-medium text-sm" }, "Export last 60 days as CSV"),
-    showExport && h("div", { className: "fixed inset-0 flex items-center justify-center px-5", style: { background: "rgba(8,11,17,0.72)" } },
-      h("div", { style: { background: COLORS.card }, className: "w-full max-w-md rounded-3xl p-5 max-h-[80vh] flex flex-col" },
-        h("div", { className: "flex items-center justify-between mb-3" },
-          h("div", { style: { color: COLORS.ink }, className: "font-display text-lg" }, "Export CSV"),
-          h("button", { onClick: function () { setShowExport(false); }, style: { color: COLORS.slate } }, "✕")
-        ),
-        h("textarea", {
-          readOnly: true, value: csv || "No data yet.", onFocus: function (ev) { ev.target.select(); },
-          style: { borderColor: COLORS.line, background: COLORS.parchment, color: COLORS.ink }, className: "flex-1 w-full px-3 py-2.5 rounded-xl border outline-none text-[11px] font-mono resize-none", rows: 10
-        }),
-        h("button", { onClick: function () { navigator.clipboard.writeText(csv).catch(function () {}); }, style: { background: COLORS.emphasis }, className: "w-full py-3 rounded-2xl text-white font-medium mt-3" }, "Copy to clipboard")
-      )
+    h("button", { onClick: function () { navigate({ sheet: "export" }, true); }, style: { borderColor: COLORS.line, color: COLORS.ink }, className: "w-full py-3 rounded-2xl border font-medium text-sm" }, "Export last 60 days as CSV"),
+
+    // ---- Overlays. All four are bottom sheets: ✕, Esc, a downward swipe
+    // and the Back button each dismiss exactly one of them (rules 6 + 14).
+    advisorDetailSheet,
+
+    showExport && h(BottomSheet, { title: "Export CSV", subtitle: "Last 60 days of activity", onClose: closeSheet },
+      h("textarea", {
+        readOnly: true, value: csv || "No data yet.", onFocus: function (ev) { ev.target.select(); },
+        style: { borderColor: COLORS.line, background: COLORS.parchment, color: COLORS.ink },
+        className: "w-full px-3 py-2.5 rounded-xl border outline-none text-[11px] font-mono resize-none", rows: 10
+      }),
+      h(CopyButton, { text: csv })
+    ),
+
+    showAddSub && h(BottomSheet, { title: "Add submission", subtitle: "Logged on behalf of an advisor", onClose: closeSheet },
+      h(ManagerAddSubmissionForm, {
+        roster: activeRoster,
+        onAdd: onAddManagerSubmission,
+        onDone: closeSheet,
+        colors: COLORS
+      })
+    ),
+
+    showAddAdvisor && h(BottomSheet, { title: "Add advisor", subtitle: "They set their own PIN on first sign-in", onClose: closeSheet },
+      h(AddAdvisorCard, { onAddAdvisor: onAddAdvisor, onDone: closeSheet })
     )
+  );
+}
+
+// Copy-to-clipboard that always says what happened — a button that looks
+// identical before and after a tap is indistinguishable from a broken one.
+function CopyButton(props) {
+  var stateSt = useState("idle"); var state = stateSt[0], setState = stateSt[1];
+  var copy = function () {
+    setState("working");
+    var done = function (ok) {
+      setState(ok ? "done" : "failed");
+      setTimeout(function () { setState("idle"); }, 2200);
+    };
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(props.text || "").then(function () { done(true); }, function () { done(false); });
+      } else { done(false); }
+    } catch (e) { done(false); }
+  };
+  return h("div", { className: "mt-3" },
+    h(BusyButton, {
+      busy: state === "working", busyLabel: "Copying\u2026",
+      label: state === "done" ? "\u2713 Copied" : state === "failed" ? "Couldn't copy \u2014 select the text above" : "Copy to clipboard",
+      onClick: copy,
+      style: { background: state === "done" ? COLORS.good : COLORS.emphasis }
+    })
   );
 }
  
@@ -2453,9 +3641,13 @@ function ManagerView(props) {
 // manager's own session in as the new advisor (unlike the old self-service
 // flow it replaces).
 function AddAdvisorCard(props) {
-  var open = props.open, onToggle = props.onToggle, onAddAdvisor = props.onAddAdvisor;
-  var nameState = useState(""); var name = nameState[0], setName = nameState[1];
-  var codeState = useState(""); var code = codeState[0], setCode = codeState[1];
+  var onAddAdvisor = props.onAddAdvisor, onDone = props.onDone;
+  // RULE 12: typed-but-unsubmitted names survive closing the sheet.
+  var form = useDraftForm("mgr-add-advisor", { name: "", code: "" });
+  var draft = form[0], patchDraft = form[1], clearDraft = form[2];
+  var name = draft.name, code = draft.code;
+  function setName(v) { patchDraft({ name: v }); }
+  function setCode(v) { patchDraft({ code: v }); }
   var busyState = useState(false); var busy = busyState[0], setBusy = busyState[1];
   var errState = useState(""); var err = errState[0], setErr = errState[1];
   var okState = useState(false); var justAdded = okState[0], setJustAdded = okState[1];
@@ -2469,16 +3661,13 @@ function AddAdvisorCard(props) {
     var res = await onAddAdvisor({ name: nm, code: cd });
     setBusy(false);
     if (!res.ok) { setErr(res.message); return; }
-    setName(""); setCode("");
-    setJustAdded(true); setTimeout(function () { setJustAdded(false); }, 2000);
+    clearDraft();
+    setJustAdded(true);
+    setTimeout(function () { setJustAdded(false); if (onDone) onDone(); }, 1600);
   };
  
   return h("div", null,
-    h("div", { className: "flex items-center justify-between mb-2.5" },
-      h(SectionTitle, { label: "Add Advisor", bare: true }),
-      h("button", { onClick: onToggle, style: { color: COLORS.brass }, className: "text-xs font-mono" }, open ? "cancel" : "+ add")
-    ),
-    open && h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4 space-y-2" },
+    h("div", { className: "space-y-2" },
       h("div", { style: { color: COLORS.slate }, className: "text-[11px] leading-relaxed mb-1" },
         "Creates the account directly \u2014 no approval step needed since you're the one adding it. They'll set their own PIN the first time they sign in."),
       h("input", {
@@ -2493,11 +3682,10 @@ function AddAdvisorCard(props) {
       }),
       err && h("div", { style: { color: COLORS.rust }, className: "text-xs" }, err),
       justAdded && h("div", { style: { color: COLORS.good }, className: "text-xs" }, "Added \u2014 they can sign in and set their PIN now."),
-      h("button", {
-        onClick: submit, disabled: busy,
-        style: { background: busy ? COLORS.line : COLORS.emphasis, opacity: busy ? 0.7 : 1 },
+      h(BusyButton, {
+        onClick: submit, busy: busy, busyLabel: "Adding\u2026", label: "Add advisor",
         className: "w-full py-2.5 rounded-xl text-white text-sm font-semibold active:scale-[0.98] transition-transform"
-      }, busy ? "Adding\u2026" : "Add advisor")
+      })
     )
   );
 }
@@ -2547,11 +3735,11 @@ function PendingRow(props) {
     }),
     err && h("div", { style: { color: COLORS.rust }, className: "text-xs" }, err),
     h("div", { className: "flex gap-2" },
-      h("button", {
-        onClick: approve, disabled: busy,
-        style: { background: COLORS.good, opacity: busy ? 0.7 : 1 },
+      h(BusyButton, {
+        onClick: approve, busy: busy, busyLabel: "Approving", label: "Approve",
+        style: { background: COLORS.good },
         className: "flex-1 py-2 rounded-xl text-white text-xs font-semibold active:scale-[0.98] transition-transform"
-      }, busy ? "\u2026" : "Approve"),
+      }),
       h("button", {
         onClick: reject,
         style: { borderColor: COLORS.rust, color: COLORS.rust },
@@ -2563,10 +3751,19 @@ function PendingRow(props) {
  
 function ForumEventCard(props) {
   var event = props.event, onSave = props.onSave;
-  var dateState = useState(event ? event.event_date : todayStr()); var eventDate = dateState[0], setEventDate = dateState[1];
-  var regState = useState(event ? String(event.registrants_count || 0) : "0"); var registrants = regState[0], setRegistrants = regState[1];
-  var attState = useState(event ? String(event.attendees_count || 0) : "0"); var attendees = attState[0], setAttendees = attState[1];
-  var venueState = useState(event ? (event.venue_confirmed_date || "") : ""); var venueDate = venueState[0], setVenueDate = venueState[1];
+  // RULE 12: a part-filled forum event is kept on the device until saved.
+  var form = useDraftForm("forum-event-" + (event ? event.id : "new"), {
+    eventDate: event ? event.event_date : todayStr(),
+    registrants: event ? String(event.registrants_count || 0) : "0",
+    attendees: event ? String(event.attendees_count || 0) : "0",
+    venueDate: event ? (event.venue_confirmed_date || "") : ""
+  });
+  var fd = form[0], patchForm = form[1], clearForm = form[2];
+  var eventDate = fd.eventDate, registrants = fd.registrants, attendees = fd.attendees, venueDate = fd.venueDate;
+  function setEventDate(v) { patchForm({ eventDate: v }); }
+  function setRegistrants(v) { patchForm({ registrants: v }); }
+  function setAttendees(v) { patchForm({ attendees: v }); }
+  function setVenueDate(v) { patchForm({ venueDate: v }); }
   var savingState = useState(false); var saving = savingState[0], setSaving = savingState[1];
   var msgState = useState(""); var msg = msgState[0], setMsg = msgState[1];
  
@@ -2580,6 +3777,7 @@ function ForumEventCard(props) {
       venue_confirmed_date: venueDate || null
     });
     setSaving(false);
+    if (ok) clearForm();
     setMsg(ok ? "Saved." : "Couldn't save \u2014 try again.");
   };
  
@@ -2616,9 +3814,11 @@ function ForumEventCard(props) {
           style: { borderColor: COLORS.line, background: COLORS.parchment, color: COLORS.ink }, className: "w-full px-3 py-2.5 rounded-xl border outline-none focus:ring-2 text-sm font-mono"
         })
       ),
-      h("button", {
-        onClick: submit, disabled: saving, style: { background: COLORS.emphasis }, className: "w-full py-2.5 rounded-xl text-white text-sm font-medium"
-      }, saving ? "\u2026" : (event ? "Update event" : "Save event")),
+      h(BusyButton, {
+        onClick: submit, busy: saving, busyLabel: "Saving\u2026",
+        label: event ? "Update event" : "Save event",
+        className: "w-full py-2.5 rounded-xl text-white text-sm font-medium"
+      }),
       msg && h("div", { style: { color: COLORS.slate }, className: "text-[11px] text-center" }, msg)
     )
   );
@@ -2637,11 +3837,19 @@ function RecruitmentView(props) {
   var ratioFlag = !!(leadsRow && interviewsRow && leadsRow.actual_value >= leadsRow.target_value && interviewsRow.actual_value < interviewsRow.target_value);
   var showUpFlag = !!(showUpRow && showUpRow.actual_value > 0 && showUpRow.actual_value < showUpRow.target_value);
   var latestEvent = forumEvents.length ? forumEvents[0] : null;
+
+  // RULE 12: the daily note is cached per day and cleared once saved.
+  var noteDraft = useDraft("aces-note-" + (today || "today"), null);
+  var noteVal = noteDraft[0], setNoteVal = noteDraft[1], clearNoteDraft = noteDraft[2];
+  var savedNote = (todayLog && todayLog.notes) || "";
+  var noteText = (noteVal === null || noteVal === undefined) ? savedNote : noteVal;
  
   return h("div", { className: "px-5 mt-6 space-y-6 pb-2" },
     h("div", { className: "flex items-center justify-between" },
       h("div", { style: { color: COLORS.slate }, className: "text-xs font-mono uppercase tracking-wide" }, "This month's scorecard"),
-      h("button", { onClick: onRefresh, style: { color: COLORS.brass }, className: "text-xs font-mono" }, loading ? "\u2026" : "refresh")
+      h("button", { onClick: onRefresh, disabled: loading, style: { color: COLORS.brass }, className: "text-xs font-mono flex items-center gap-1.5" },
+        loading ? h(Spinner, { size: 11, color: COLORS.brass }) : null,
+        loading ? "refreshing" : "refresh")
     ),
  
     !readOnly && h(ForumEventCard, { event: latestEvent, onSave: onSaveForumEvent }),
@@ -2674,7 +3882,10 @@ function RecruitmentView(props) {
         h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4" },
           h("div", { style: { color: COLORS.slate }, className: "text-xs font-mono uppercase tracking-wide mb-2" }, "Notes (optional)"),
           h("textarea", {
-            defaultValue: (todayLog && todayLog.notes) || "", onBlur: function (ev) { onSaveNote(ev.target.value); }, placeholder: "Anything worth flagging today?",
+            value: noteText,
+            onChange: function (ev) { setNoteVal(ev.target.value); },
+            onBlur: function (ev) { onSaveNote(ev.target.value); clearNoteDraft(); },
+            placeholder: "Anything worth flagging today?",
             style: { borderColor: COLORS.line, background: COLORS.parchment, color: COLORS.ink }, className: "w-full px-3 py-2.5 rounded-xl border outline-none focus:ring-2 text-sm resize-none", rows: 2
           })
         )
@@ -2700,7 +3911,9 @@ function RecruitmentView(props) {
     h("div", null,
       h(SectionTitle, { label: "5 KPIs" }),
       scorecard.length === 0
-        ? h("div", { style: { background: COLORS.card, borderColor: COLORS.line, color: COLORS.slate }, className: "rounded-2xl border p-5 text-sm text-center" }, "No data yet this month.")
+        ? (loading
+            ? h("div", { className: "space-y-3" }, h(SkeletonCard, { lines: 3 }), h(SkeletonCard, { lines: 3 }), h(SkeletonCard, { lines: 3 }))
+            : h("div", { style: { background: COLORS.card, borderColor: COLORS.line, color: COLORS.slate }, className: "rounded-2xl border p-5 text-sm text-center" }, "No data yet this month."))
         : h("div", { className: "space-y-3" },
             scorecard.map(function (row) {
               var pct = Math.min(row.pct_of_target || 0, 100);
@@ -2722,9 +3935,14 @@ function RecruitmentView(props) {
  
 function SubmissionBox(props) {
   var mySubmissions = props.mySubmissions, onAddSubmission = props.onAddSubmission;
-  var amtState = useState(""); var amount = amtState[0], setAmount = amtState[1];
-  var serState = useState(""); var serial = serState[0], setSerial = serState[1];
-  var nameState = useState(""); var clientName = nameState[0], setClientName = nameState[1];
+  // RULE 12: an APP serial typed but not yet submitted is never lost to a
+  // tab switch or a reload — it is the single most annoying field to retype.
+  var form = useDraftForm("advisor-submission", { amount: "", serial: "", clientName: "" });
+  var fd = form[0], patchForm = form[1], clearForm = form[2];
+  var amount = fd.amount, serial = fd.serial, clientName = fd.clientName;
+  function setAmount(v) { patchForm({ amount: v }); }
+  function setSerial(v) { patchForm({ serial: v }); }
+  function setClientName(v) { patchForm({ clientName: v }); }
   var errState = useState(""); var error = errState[0], setError = errState[1];
   var busyState = useState(false); var busy = busyState[0], setBusy = busyState[1];
   var okState = useState(false); var justSaved = okState[0], setJustSaved = okState[1];
@@ -2735,7 +3953,7 @@ function SubmissionBox(props) {
     var res = await onAddSubmission(amount, serial, clientName);
     setBusy(false);
     if (!res || !res.ok) { setError((res && res.message) || "Couldn't save."); return; }
-    setAmount(""); setSerial(""); setClientName("");
+    clearForm();
     setJustSaved(true); setTimeout(function () { setJustSaved(false); }, 2200);
   };
  
@@ -2768,11 +3986,10 @@ function SubmissionBox(props) {
       }),
       error && h("div", { style: { color: COLORS.rust }, className: "text-xs" }, error),
       justSaved && h("div", { style: { color: COLORS.good }, className: "text-xs" }, "Submitted \u2014 waiting for manager verification."),
-      h("button", {
-        onClick: submit, disabled: busy,
-        style: { background: busy ? COLORS.line : COLORS.emphasis, opacity: busy ? 0.7 : 1 },
+      h(BusyButton, {
+        onClick: submit, busy: busy, busyLabel: "Saving\u2026", label: "Add submission",
         className: "w-full py-2.5 rounded-xl text-white text-sm font-semibold active:scale-[0.98] transition-transform"
-      }, busy ? "Saving\u2026" : "Add submission")
+      })
     ),
  
     h("div", { className: "flex items-center gap-4 mt-4 pt-3", style: { borderTop: "1px solid " + COLORS.line } },
@@ -2799,9 +4016,9 @@ function SubmissionBox(props) {
               s.app_serial + (s.client_name ? " \u00b7 " + s.client_name : ""))
           ),
           h("div", {
-            style: { color: s.settled ? COLORS.good : COLORS.brass },
+            style: { color: s._pending ? COLORS.slate : (s.settled ? COLORS.good : COLORS.brass) },
             className: "text-[10px] font-mono uppercase tracking-wide shrink-0"
-          }, s.settled ? "\u2713 Settled" : "Pending")
+          }, s._pending ? "Saving\u2026" : (s.settled ? "\u2713 Settled" : "Pending"))
         );
       })
     )
@@ -2811,13 +4028,21 @@ function SubmissionBox(props) {
  
 function ManagerAddSubmissionForm(props) {
   var roster = props.roster || [], onAdd = props.onAdd, onDone = props.onDone;
-  var advisorState = useState(""); var advisorCode = advisorState[0], setAdvisorCode = advisorState[1];
-  var serialState = useState(""); var serial = serialState[0], setSerial = serialState[1];
-  var clientState = useState(""); var clientName = clientState[0], setClientName = clientState[1];
-  var amtState = useState(""); var amount = amtState[0], setAmount = amtState[1];
-  var nbAcState = useState(""); var nbAc = nbAcState[0], setNbAc = nbAcState[1];
-  var subDateState = useState(""); var submittedDate = subDateState[0], setSubmittedDate = subDateState[1];
-  var setDateState = useState(""); var settledDate = setDateState[0], setSettledDate = setDateState[1];
+  // RULE 12: seven fields is exactly the kind of form nobody wants to
+  // retype, so it is written to the device on every keystroke.
+  var form = useDraftForm("mgr-add-submission", {
+    advisorCode: "", serial: "", clientName: "", amount: "", nbAc: "", submittedDate: "", settledDate: ""
+  });
+  var fd = form[0], patchForm = form[1], clearForm = form[2];
+  var advisorCode = fd.advisorCode, serial = fd.serial, clientName = fd.clientName,
+      amount = fd.amount, nbAc = fd.nbAc, submittedDate = fd.submittedDate, settledDate = fd.settledDate;
+  function setAdvisorCode(v) { patchForm({ advisorCode: v }); }
+  function setSerial(v) { patchForm({ serial: v }); }
+  function setClientName(v) { patchForm({ clientName: v }); }
+  function setAmount(v) { patchForm({ amount: v }); }
+  function setNbAc(v) { patchForm({ nbAc: v }); }
+  function setSubmittedDate(v) { patchForm({ submittedDate: v }); }
+  function setSettledDate(v) { patchForm({ settledDate: v }); }
   var errState = useState(""); var err = errState[0], setErr = errState[1];
   var busyState = useState(false); var busy = busyState[0], setBusy = busyState[1];
   var okState = useState(false); var justSaved = okState[0], setJustSaved = okState[1];
@@ -2834,15 +4059,14 @@ function ManagerAddSubmissionForm(props) {
       amount, nbAc, submittedDate || null, settledDate || null);
     setBusy(false);
     if (!res || !res.ok) { setErr((res && res.message) || "Couldn't save."); return; }
-    setSerial(""); setClientName(""); setAmount(""); setNbAc("");
-    setSubmittedDate(""); setSettledDate("");
+    clearForm();
     setJustSaved(true); setTimeout(function () { setJustSaved(false); onDone(); }, 1800);
   };
  
   var inp = { borderColor: COLORS.line, background: COLORS.parchment, color: COLORS.ink };
   var cls = "w-full px-3 py-2.5 rounded-xl border outline-none focus:ring-2 text-sm";
  
-  return h("div", { style: { background: COLORS.card, borderColor: COLORS.line }, className: "rounded-2xl border p-4 space-y-2 mb-3" },
+  return h("div", { className: "space-y-2" },
     h("div", { style: { color: COLORS.slate }, className: "text-[11px] leading-relaxed mb-1" },
       "All fields except client name and settled date are required. If settled date is empty, the policy stays pending."),
     h("select", {
@@ -2872,11 +4096,10 @@ function ManagerAddSubmissionForm(props) {
     ),
     err && h("div", { style: { color: COLORS.rust }, className: "text-xs" }, err),
     justSaved && h("div", { style: { color: COLORS.good }, className: "text-xs" }, "Submission logged — mark settled in FYP Verification if approved."),
-    h("button", {
-      onClick: submit, disabled: busy,
-      style: { background: busy ? COLORS.line : COLORS.emphasis, opacity: busy ? 0.7 : 1 },
+    h(BusyButton, {
+      onClick: submit, busy: busy, busyLabel: "Saving\u2026", label: "Log submission",
       className: "w-full py-2.5 rounded-xl text-white text-sm font-semibold active:scale-[0.98] transition-transform"
-    }, busy ? "Saving…" : "Log submission")
+    })
   );
 }
  
